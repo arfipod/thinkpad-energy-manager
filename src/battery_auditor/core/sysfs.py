@@ -6,7 +6,6 @@ from pathlib import Path
 
 from battery_auditor.core.models import BatterySnapshot, PowerSupplySnapshot, SystemSnapshot
 
-
 BATTERY_FIELDS = {
     "present",
     "status",

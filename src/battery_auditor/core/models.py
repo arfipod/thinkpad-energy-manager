@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
-
 
 Micro = int
 
 
 def wall_iso_from_timestamp(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().isoformat(timespec="seconds")
 
 
 def percent(numerator: int | None, denominator: int | None) -> float | None:
-    if numerator is None or denominator in (None, 0):
+    if numerator is None or denominator is None or denominator == 0:
         return None
     return (numerator / denominator) * 100.0
 

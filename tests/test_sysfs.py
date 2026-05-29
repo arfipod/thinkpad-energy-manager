@@ -4,7 +4,6 @@ from pathlib import Path
 
 from battery_auditor.core.sysfs import read_snapshot
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "sysfs_sample"
 
 

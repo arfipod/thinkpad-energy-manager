@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 from battery_auditor.config import AuditorConfig, load_config
@@ -24,12 +23,12 @@ try:
         QLineEdit,
         QMainWindow,
         QMessageBox,
-        QPushButton,
         QPlainTextEdit,
+        QPushButton,
         QSpinBox,
-        QTabWidget,
         QTableWidget,
         QTableWidgetItem,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -66,7 +65,7 @@ class SimpleLineChart(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect().adjusted(12, 12, -12, -12)
         painter.drawText(rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter, self.title)
-        plot = rect.adjusted(50, 34, -20, -44)
+        plot = QRectF(rect.adjusted(50, 34, -20, -44))
         painter.drawRect(plot)
 
         all_points = [point for _name, points in self.series for point in points]
@@ -110,7 +109,7 @@ class SimpleLineChart(QWidget):
             mapped = [self._map_point(x, y, min_x, max_x, min_y, max_y, plot) for x, y in points]
             for a, b in zip(mapped, mapped[1:], strict=False):
                 painter.drawLine(a, b)
-            painter.drawText(plot.left() + index * 130, legend_y, name)
+            painter.drawText(QPointF(plot.left() + index * 130, legend_y), name)
 
     @staticmethod
     def _map_point(x: float, y: float, min_x: float, max_x: float, min_y: float, max_y: float, plot: QRectF) -> QPointF:
@@ -401,7 +400,7 @@ class MainWindow(QMainWindow):
 
     def _append_process_output(self, process: QProcess, stdout: bool) -> None:
         data = process.readAllStandardOutput() if stdout else process.readAllStandardError()
-        text = bytes(data).decode("utf-8", errors="replace")
+        text = bytes(data.data()).decode("utf-8", errors="replace")
         if text:
             self.collector_output.appendPlainText(text.rstrip())
 

@@ -7,7 +7,6 @@ from battery_auditor.config import AuditorConfig, TlpThresholdExpectation
 from battery_auditor.core.events import EventDetector
 from battery_auditor.core.sysfs import read_snapshot
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "sysfs_sample"
 
 
@@ -29,3 +28,14 @@ def test_percent_jump_event() -> None:
     snap2.batteries[0].capacity_percent = 1.0
     events = detector.process(snap2)
     assert any(e.event_type == "PERCENT_JUMP" for e in events)
+
+
+def test_sample_delay_uses_effective_interval() -> None:
+    cfg = AuditorConfig(sysfs_power_supply_dir=FIXTURE, interval_seconds=10.0)
+    detector = EventDetector(cfg)
+    snap1 = read_snapshot(FIXTURE)
+    detector.process(snap1)
+    snap2 = deepcopy(snap1)
+    snap2.monotonic_time = snap1.monotonic_time + 10.0
+    events = detector.process(snap2)
+    assert not any(e.event_type == "MISSED_SAMPLE_WINDOW" for e in events)

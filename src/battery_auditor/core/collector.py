@@ -4,6 +4,7 @@ import json
 import signal
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +55,7 @@ class BatteryCollector:
             self.db.recover_open_sessions()
 
         interval = float(interval_seconds or self.cfg.interval_seconds)
+        self.cfg.interval_seconds = interval
         session_id = self._new_session_id()
         self.db.start_session(session_id=session_id, name=name, cfg_json=self.cfg.to_json())
         self.install_signal_handlers()
@@ -142,7 +144,5 @@ class BatteryCollector:
         tmp_path.replace(path)
 
     def _remove_heartbeat_file(self, session_id: str) -> None:
-        try:
+        with suppress(FileNotFoundError):
             self._heartbeat_path(session_id).unlink()
-        except FileNotFoundError:
-            pass

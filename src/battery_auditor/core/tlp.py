@@ -64,9 +64,8 @@ class TlpClient:
         if shutil.which(executable) is None:
             return CommandResult(command, 127, "", f"Command not found: {executable}")
         full_command = command
-        if sudo and self.use_sudo:
-            if shutil.which("sudo") is not None:
-                full_command = ["sudo", *command]
+        if sudo and self.use_sudo and shutil.which("sudo") is not None:
+            full_command = ["sudo", *command]
         try:
             completed = subprocess.run(
                 full_command,
@@ -77,7 +76,9 @@ class TlpClient:
             )
             return CommandResult(full_command, completed.returncode, completed.stdout, completed.stderr)
         except subprocess.TimeoutExpired as exc:
-            return CommandResult(full_command, 124, exc.stdout or "", exc.stderr or "Command timed out")
+            stdout = self._timeout_output_to_text(exc.stdout)
+            stderr = self._timeout_output_to_text(exc.stderr) or "Command timed out"
+            return CommandResult(full_command, 124, stdout, stderr)
 
     @staticmethod
     def _validate_thresholds(start: int, stop: int) -> None:
@@ -92,3 +93,11 @@ class TlpClient:
     def _validate_battery_name(battery: str) -> None:
         if not battery.startswith("BAT") or not battery[3:].isdigit():
             raise ValueError("battery name must look like BAT0, BAT1, ...")
+
+    @staticmethod
+    def _timeout_output_to_text(value: str | bytes | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value

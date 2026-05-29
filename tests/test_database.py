@@ -7,7 +7,6 @@ from battery_auditor.core.database import BatteryDatabase
 from battery_auditor.core.events import EventDetector
 from battery_auditor.core.sysfs import read_snapshot
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "sysfs_sample"
 
 

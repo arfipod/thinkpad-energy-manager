@@ -5,12 +5,12 @@ import os
 import platform
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, cast
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.models import BatterySnapshot, Event, SystemSnapshot
-
 
 SCHEMA_VERSION = 1
 
@@ -295,7 +295,8 @@ class BatteryDatabase:
                 time.time(),
             ),
         )
-        sample_id = int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        sample_id = cur.lastrowid
         for battery in snap.batteries:
             self._insert_battery(conn, session_id, sample_id, battery)
         for supply in snap.power_supplies:
@@ -439,7 +440,7 @@ class BatteryDatabase:
 
     def get_session(self, session_id: str) -> sqlite3.Row | None:
         conn = self.connect()
-        return conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return cast(sqlite3.Row | None, conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone())
 
     def fetch_session_series(self, session_id: str, limit: int | None = None) -> list[sqlite3.Row]:
         conn = self.connect()
