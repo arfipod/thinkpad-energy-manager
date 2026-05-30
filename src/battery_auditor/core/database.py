@@ -152,7 +152,6 @@ class BatteryDatabase:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(f"PRAGMA journal_mode = {self.cfg.sqlite_journal_mode}")
         conn.execute(f"PRAGMA synchronous = {self.cfg.sqlite_synchronous}")
         conn.execute(f"PRAGMA wal_autocheckpoint = {int(self.cfg.sqlite_wal_autocheckpoint_pages)}")
         self.conn = conn
@@ -163,8 +162,14 @@ class BatteryDatabase:
             self.conn.close()
             self.conn = None
 
-    def init_schema(self) -> None:
+    def init_schema(self, *, configure_journal: bool = True) -> None:
         conn = self.connect()
+        if configure_journal:
+            try:
+                conn.execute(f"PRAGMA journal_mode = {self.cfg.sqlite_journal_mode}")
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower():
+                    raise
         conn.executescript(SCHEMA_SQL)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()

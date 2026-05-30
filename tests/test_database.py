@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.database import DATA_TABLES, BatteryDatabase, repair_database
@@ -26,6 +28,78 @@ def test_insert_and_fetch_session(tmp_path: Path) -> None:
     assert len(sessions) == 1
     rows = db.fetch_session_series("s1")
     assert len(rows) == 2
+
+
+def test_init_schema_tolerates_locked_journal_mode_pragma(tmp_path: Path, monkeypatch: Any) -> None:
+    db_path = tmp_path / "test.sqlite3"
+    real_connect = sqlite3.connect
+
+    class LockedJournalModeConnection:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        @property
+        def row_factory(self) -> Any:
+            return self.conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value: Any) -> None:
+            self.conn.row_factory = value
+
+        def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            if sql.startswith("PRAGMA journal_mode"):
+                raise sqlite3.OperationalError("database is locked")
+            return self.conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.conn, name)
+
+    def locked_connect(*args: Any, **kwargs: Any) -> LockedJournalModeConnection:
+        return LockedJournalModeConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", locked_connect)
+    cfg = AuditorConfig(data_dir=tmp_path, db_path=db_path, sysfs_power_supply_dir=FIXTURE)
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+
+    db.init_schema()
+
+    assert db.check_integrity(quick=True) == ["ok"]
+
+
+def test_reader_schema_init_does_not_reconfigure_journal(tmp_path: Path, monkeypatch: Any) -> None:
+    db_path = tmp_path / "test.sqlite3"
+    real_connect = sqlite3.connect
+
+    class RejectJournalModeConnection:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+
+        @property
+        def row_factory(self) -> Any:
+            return self.conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value: Any) -> None:
+            self.conn.row_factory = value
+
+        def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            if sql.startswith("PRAGMA journal_mode"):
+                raise AssertionError("reader connection must not reconfigure journal mode")
+            return self.conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.conn, name)
+
+    def rejecting_connect(*args: Any, **kwargs: Any) -> RejectJournalModeConnection:
+        return RejectJournalModeConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", rejecting_connect)
+    cfg = AuditorConfig(data_dir=tmp_path, db_path=db_path, sysfs_power_supply_dir=FIXTURE)
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+
+    db.init_schema(configure_journal=False)
+
+    assert db.check_integrity(quick=True) == ["ok"]
 
 
 def test_recover_open_session(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from battery_auditor.core.runtime import (
     STATUS_PAUSED,
     STATUS_RUNNING,
     STATUS_UNKNOWN,
+    CollectorStatus,
     collect_runtime_status,
 )
 from battery_auditor.core.sysfs import read_snapshot
@@ -151,7 +152,7 @@ class MainWindow(QMainWindow):
         self.db_available = True
         self.db_error: str | None = None
         try:
-            self.db.init_schema()
+            self.db.init_schema(configure_journal=False)
             integrity = self.db.check_integrity(quick=True)
             if integrity != ["ok"]:
                 raise sqlite3.DatabaseError("; ".join(integrity))
@@ -160,6 +161,8 @@ class MainWindow(QMainWindow):
         self._chart_session_id: str | None = None
         self._chart_rows: list[Any] = []
         self._chart_last_seq: int | None = None
+        self._active_collector_session_id: str | None = None
+        self._user_pinned_chart_session = False
 
         self.setWindowTitle("Battery Auditor")
         self.resize(1080, 760)
@@ -301,7 +304,7 @@ class MainWindow(QMainWindow):
         export_csv = QPushButton("Export CSV")
         refresh.clicked.connect(self.refresh_sessions_and_chart)
         export_csv.clicked.connect(self.export_selected_session_csv)
-        self.session_combo.currentIndexChanged.connect(self.refresh_chart)
+        self.session_combo.currentIndexChanged.connect(self._session_combo_changed)
         self.metric_combo.currentIndexChanged.connect(self.refresh_chart)
         controls.addWidget(QLabel("Session"))
         controls.addWidget(self.session_combo, 1)
@@ -371,13 +374,28 @@ class MainWindow(QMainWindow):
         return widget
 
     def refresh_all(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
-        self.refresh_collector_status()
-        self.refresh_sessions(prefer_running_session=prefer_running_session)
+        if not self.db_available:
+            self._try_restore_database()
+        status = self.refresh_collector_status()
+        if prefer_running_session:
+            self._user_pinned_chart_session = False
+        active_session_id = self._active_session_id_from_status(status)
+        should_follow_active = prefer_running_session or not self._user_pinned_chart_session
+        preferred_session_id = active_session_id if should_follow_active else None
+        self.refresh_sessions(
+            prefer_running_session=prefer_running_session,
+            preferred_session_id=preferred_session_id,
+        )
         self.refresh_live_snapshot()
         self.refresh_chart()
         self.refresh_events()
 
-    def refresh_sessions(self, *, prefer_running_session: bool = False) -> None:
+    def refresh_sessions(
+        self,
+        *,
+        prefer_running_session: bool = False,
+        preferred_session_id: str | None = None,
+    ) -> None:
         if not self.db_available:
             self._show_database_error()
             if hasattr(self, "session_combo"):
@@ -402,7 +420,10 @@ class MainWindow(QMainWindow):
             self.session_combo.blockSignals(False)
             self._show_database_error()
             return
-        if prefer_running_session and running_index is not None:
+        preferred_index = self.session_combo.findData(preferred_session_id) if preferred_session_id else -1
+        if preferred_index >= 0:
+            self.session_combo.setCurrentIndex(preferred_index)
+        elif prefer_running_session and running_index is not None:
             self.session_combo.setCurrentIndex(running_index)
         elif current:
             index = self.session_combo.findData(current)
@@ -414,12 +435,13 @@ class MainWindow(QMainWindow):
             self.session_combo.setCurrentIndex(running_index)
         self.session_combo.blockSignals(False)
 
-    def refresh_collector_status(self) -> None:
+    def refresh_collector_status(self) -> CollectorStatus:
         db = self.db if self.db_available else None
         status = collect_runtime_status(self.cfg, db)
         payload = status.to_dict()
+        self._active_collector_session_id = self._active_session_id_from_status(status)
         if not hasattr(self, "collector_state_label"):
-            return
+            return status
         self.collector_state_label.setText(str(payload["state"]))
         self.collector_pid_label.setText("none" if payload["pid"] is None else str(payload["pid"]))
         session = payload.get("current_session_id") or "none"
@@ -438,6 +460,7 @@ class MainWindow(QMainWindow):
         self.resume_record_button.setEnabled(status.state == STATUS_PAUSED or status.control.paused)
         self.stop_record_button.setEnabled(active)
         self.force_stop_record_button.setEnabled(active)
+        return status
 
     def refresh_live_snapshot(self) -> None:
         snap = read_snapshot(self.cfg.sysfs_power_supply_dir)
@@ -485,16 +508,27 @@ class MainWindow(QMainWindow):
         self.chart.set_data(f"{metric} — {session_id}", metric, sorted(grouped.items()))
 
     def refresh_sessions_and_chart(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
-        self.refresh_sessions(prefer_running_session=prefer_running_session)
+        preferred_session_id = self._active_collector_session_id if prefer_running_session else None
+        self.refresh_sessions(
+            prefer_running_session=prefer_running_session,
+            preferred_session_id=preferred_session_id,
+        )
         self.refresh_chart(force=True)
 
     def open_session_in_chart(self, session_id: str) -> None:
+        self._user_pinned_chart_session = True
         index = self.session_combo.findData(session_id)
         if index < 0:
             self.refresh_sessions()
             index = self.session_combo.findData(session_id)
         if index >= 0:
             self.session_combo.setCurrentIndex(index)
+        self.refresh_chart(force=True)
+
+    def _session_combo_changed(self, _index: int) -> None:
+        current = self.session_combo.currentData()
+        if current is not None and str(current) != (self._active_collector_session_id or ""):
+            self._user_pinned_chart_session = True
         self.refresh_chart(force=True)
 
     def refresh_events(self) -> None:
@@ -831,7 +865,7 @@ class MainWindow(QMainWindow):
             return
 
         self.db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
-        self.db.init_schema()
+        self.db.init_schema(configure_journal=False)
         if hasattr(self, "sessions_manager"):
             self.sessions_manager.db = self.db
         self.db_available = True
@@ -842,6 +876,33 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.information(self, "Repair database", f"Database repaired.\nBackup: {result.backup_path}")
         self.refresh_all()
+
+    @staticmethod
+    def _active_session_id_from_status(status: CollectorStatus) -> str | None:
+        if status.state not in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN}:
+            return None
+        return None if status.current_session_id is None else str(status.current_session_id)
+
+    def _try_restore_database(self) -> None:
+        replacement = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
+        try:
+            replacement.init_schema(configure_journal=False)
+            integrity = replacement.check_integrity(quick=True)
+            if integrity != ["ok"]:
+                raise sqlite3.DatabaseError("; ".join(integrity))
+        except sqlite3.DatabaseError as exc:
+            replacement.close()
+            self.db_error = str(exc)
+            return
+
+        self.db.close()
+        self.db = replacement
+        if hasattr(self, "sessions_manager"):
+            self.sessions_manager.db = self.db
+        self.db_available = True
+        self.db_error = None
+        if hasattr(self, "db_status_label"):
+            self.db_status_label.setText("")
 
     def _set_database_unavailable(self, exc: sqlite3.DatabaseError) -> None:
         self.db_available = False

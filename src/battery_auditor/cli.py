@@ -131,7 +131,7 @@ def load_runtime_config(args: argparse.Namespace) -> AuditorConfig:
 
 def db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase:
     db = BatteryDatabase(cfg.resolved_db_path(), cfg)
-    db.init_schema()
+    db.init_schema(configure_journal=False)
     return db
 
 
@@ -140,7 +140,7 @@ def status_db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase | None:
         return None
     db = BatteryDatabase(cfg.resolved_db_path(), cfg)
     try:
-        db.init_schema()
+        db.init_schema(configure_journal=False)
     except Exception:  # noqa: BLE001 - runtime status should survive a damaged DB
         return None
     return db
