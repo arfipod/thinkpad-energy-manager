@@ -5,7 +5,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -13,14 +12,21 @@ from typing import Any
 from battery_auditor.config import AuditorConfig, load_config
 from battery_auditor.core.analyzer import export_session_csv
 from battery_auditor.core.database import BatteryDatabase, repair_database
+from battery_auditor.core.runtime import (
+    STATUS_PAUSED,
+    STATUS_RUNNING,
+    STATUS_UNKNOWN,
+    collect_runtime_status,
+)
 from battery_auditor.core.sysfs import read_snapshot
 from battery_auditor.core.tlp import TlpClient
+from battery_auditor.ui.session_manager import SessionManager
 
 BLACKBOX_SERVICE = "battery-auditor-blackbox.service"
 
 try:
-    import pyqtgraph as pg
-    from PySide6.QtCore import QProcess, QTimer
+    import pyqtgraph as pg  # type: ignore[import-untyped]
+    from PySide6.QtCore import QTimer
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication,
@@ -151,7 +157,9 @@ class MainWindow(QMainWindow):
                 raise sqlite3.DatabaseError("; ".join(integrity))
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
-        self.collector_process: QProcess | None = None
+        self._chart_session_id: str | None = None
+        self._chart_rows: list[Any] = []
+        self._chart_last_seq: int | None = None
 
         self.setWindowTitle("Battery Auditor")
         self.resize(1080, 760)
@@ -159,6 +167,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_overview_tab(), "Status")
         tabs.addTab(self._build_recorder_tab(), "Recording")
+        tabs.addTab(self._build_sessions_tab(), "Sessions")
         tabs.addTab(self._build_charts_tab(), "Charts")
         tabs.addTab(self._build_events_tab(), "Events")
         tabs.addTab(self._build_tlp_tab(), "TLP")
@@ -173,6 +182,8 @@ class MainWindow(QMainWindow):
         self.timer.start(int(self.cfg.ui_refresh_seconds * 1000))
 
         self.refresh_all()
+        if self.db_available and hasattr(self, "sessions_manager"):
+            self.sessions_manager.refresh()
 
     def _build_overview_tab(self) -> QWidget:
         widget = QWidget()
@@ -212,14 +223,35 @@ class MainWindow(QMainWindow):
         form.addRow("Mode", self.record_mode)
         layout.addLayout(form)
 
+        status_form = QFormLayout()
+        self.collector_state_label = QLabel("UNKNOWN")
+        self.collector_pid_label = QLabel("none")
+        self.collector_session_label = QLabel("none")
+        self.collector_heartbeat_label = QLabel("none")
+        self.collector_samples_label = QLabel("unknown")
+        status_form.addRow("Collector", self.collector_state_label)
+        status_form.addRow("PID", self.collector_pid_label)
+        status_form.addRow("Session", self.collector_session_label)
+        status_form.addRow("Last heartbeat", self.collector_heartbeat_label)
+        status_form.addRow("Samples", self.collector_samples_label)
+        layout.addLayout(status_form)
+
         row = QHBoxLayout()
         self.start_record_button = QPushButton("Start collector")
+        self.pause_record_button = QPushButton("Pause collector")
+        self.resume_record_button = QPushButton("Resume collector")
         self.stop_record_button = QPushButton("Stop collector")
-        self.stop_record_button.setEnabled(False)
+        self.force_stop_record_button = QPushButton("Force stop collector")
         self.start_record_button.clicked.connect(self.start_collector_process)
-        self.stop_record_button.clicked.connect(self.stop_collector_process)
+        self.pause_record_button.clicked.connect(self.pause_collector)
+        self.resume_record_button.clicked.connect(self.resume_collector)
+        self.stop_record_button.clicked.connect(lambda: self.stop_collector_process(force=False))
+        self.force_stop_record_button.clicked.connect(lambda: self.stop_collector_process(force=True))
         row.addWidget(self.start_record_button)
+        row.addWidget(self.pause_record_button)
+        row.addWidget(self.resume_record_button)
         row.addWidget(self.stop_record_button)
+        row.addWidget(self.force_stop_record_button)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -239,8 +271,17 @@ class MainWindow(QMainWindow):
         self.collector_output = QTextEdit()
         self.collector_output.setReadOnly(True)
         layout.addWidget(self.collector_output)
-        layout.addWidget(QLabel("Note: for a clean black-box test, start the service or CLI and close the UI."))
+        layout.addWidget(QLabel("Collectors started from the UI are detached CLI processes; closing this window does not stop measurement."))
         return widget
+
+    def _build_sessions_tab(self) -> QWidget:
+        self.sessions_manager = SessionManager(
+            self.cfg,
+            self.db,
+            open_in_chart=self.open_session_in_chart,
+            refresh_main=lambda: self.refresh_all(prefer_running_session=True),
+        )
+        return self.sessions_manager
 
     def _build_charts_tab(self) -> QWidget:
         widget = QWidget()
@@ -330,6 +371,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def refresh_all(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
+        self.refresh_collector_status()
         self.refresh_sessions(prefer_running_session=prefer_running_session)
         self.refresh_live_snapshot()
         self.refresh_chart()
@@ -372,12 +414,37 @@ class MainWindow(QMainWindow):
             self.session_combo.setCurrentIndex(running_index)
         self.session_combo.blockSignals(False)
 
+    def refresh_collector_status(self) -> None:
+        db = self.db if self.db_available else None
+        status = collect_runtime_status(self.cfg, db)
+        payload = status.to_dict()
+        if not hasattr(self, "collector_state_label"):
+            return
+        self.collector_state_label.setText(str(payload["state"]))
+        self.collector_pid_label.setText("none" if payload["pid"] is None else str(payload["pid"]))
+        session = payload.get("current_session_id") or "none"
+        if payload.get("current_session_name"):
+            session = f"{session} ({payload['current_session_name']})"
+        self.collector_session_label.setText(str(session))
+        age = payload.get("last_heartbeat_age_seconds")
+        last_iso = payload.get("last_heartbeat_iso") or "none"
+        self.collector_heartbeat_label.setText(last_iso if age is None else f"{last_iso} ({float(age):.1f}s ago)")
+        sample_count = payload.get("sample_count")
+        self.collector_samples_label.setText("unknown" if sample_count is None else str(sample_count))
+
+        active = status.state in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN}
+        self.start_record_button.setEnabled(not active)
+        self.pause_record_button.setEnabled(status.state == STATUS_RUNNING)
+        self.resume_record_button.setEnabled(status.state == STATUS_PAUSED or status.control.paused)
+        self.stop_record_button.setEnabled(active)
+        self.force_stop_record_button.setEnabled(active)
+
     def refresh_live_snapshot(self) -> None:
         snap = read_snapshot(self.cfg.sysfs_power_supply_dir)
         data = snap.to_dict()
         self.live_text.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
 
-    def refresh_chart(self) -> None:
+    def refresh_chart(self, _checked: bool = False, *, force: bool = False) -> None:
         if not self.db_available:
             self.chart.set_data("Database unavailable", "", [])
             return
@@ -386,8 +453,19 @@ class MainWindow(QMainWindow):
             self.chart.set_data("No session", "", [])
             return
         metric = self.metric_combo.currentText()
+        session_text = str(session_id)
         try:
-            rows = self.db.fetch_session_series(str(session_id))
+            if not force and self._chart_session_id == session_text and self._chart_rows:
+                new_rows = self.db.fetch_session_series(session_text, after_seq=self._chart_last_seq)
+                if new_rows:
+                    self._chart_rows.extend(new_rows)
+                    self._chart_last_seq = max(int(row["seq"]) for row in self._chart_rows)
+                rows = self._chart_rows
+            else:
+                rows = self.db.fetch_session_series(session_text)
+                self._chart_session_id = session_text
+                self._chart_rows = list(rows)
+                self._chart_last_seq = max((int(row["seq"]) for row in rows), default=None)
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
             self.chart.set_data("Database unavailable", metric, [])
@@ -408,7 +486,16 @@ class MainWindow(QMainWindow):
 
     def refresh_sessions_and_chart(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
         self.refresh_sessions(prefer_running_session=prefer_running_session)
-        self.refresh_chart()
+        self.refresh_chart(force=True)
+
+    def open_session_in_chart(self, session_id: str) -> None:
+        index = self.session_combo.findData(session_id)
+        if index < 0:
+            self.refresh_sessions()
+            index = self.session_combo.findData(session_id)
+        if index >= 0:
+            self.session_combo.setCurrentIndex(index)
+        self.refresh_chart(force=True)
 
     def refresh_events(self) -> None:
         if not self.db_available:
@@ -488,8 +575,9 @@ class MainWindow(QMainWindow):
         if not self.db_available:
             QMessageBox.warning(self, "Database unavailable", self._database_error_message())
             return
-        if self.collector_process is not None:
-            QMessageBox.information(self, "Collector", "A collector is already running from the UI.")
+        status = collect_runtime_status(self.cfg, self.db)
+        if status.state in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN}:
+            QMessageBox.information(self, "Collector", f"A collector already appears active (state={status.state}).")
             return
         if self.record_mode.currentText() == "blackbox":
             reply = QMessageBox.question(
@@ -499,12 +587,14 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        process = QProcess(self)
         args = [
+            sys.executable,
             "-m",
             "battery_auditor.cli",
             "--db",
             str(self.cfg.resolved_db_path()),
+            "--sysfs",
+            str(self.cfg.sysfs_power_supply_dir),
             "collect",
             "--name",
             self.record_name.text() or "qt-session",
@@ -513,36 +603,74 @@ class MainWindow(QMainWindow):
             "--mode",
             self.record_mode.currentText(),
         ]
-        process.setProgram(sys.executable)
-        process.setArguments(args)
-        process.readyReadStandardOutput.connect(lambda: self._append_process_output(process, stdout=True))
-        process.readyReadStandardError.connect(lambda: self._append_process_output(process, stdout=False))
-        process.finished.connect(self._collector_finished)
-        process.start()
-        self.collector_process = process
-        self.start_record_button.setEnabled(False)
-        self.stop_record_button.setEnabled(True)
-        self.collector_output.append("Collector started.")
-
-    def stop_collector_process(self) -> None:
-        if self.collector_process is None:
+        log_path = self.cfg.data_dir.expanduser() / "collector-ui.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("ab") as log:
+                subprocess.Popen(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError as exc:
+            QMessageBox.warning(self, "Collector", f"Could not start collector:\n{exc}")
             return
-        self.collector_process.terminate()
-        if not self.collector_process.waitForFinished(3000):
-            self.collector_process.kill()
+        self.collector_output.append(f"Collector started as a detached CLI process. Log: {log_path}")
+        QTimer.singleShot(1000, lambda: self.refresh_all(prefer_running_session=True))
 
-    def _append_process_output(self, process: QProcess, stdout: bool) -> None:
-        data = process.readAllStandardOutput() if stdout else process.readAllStandardError()
-        text = bytes(data.data()).decode("utf-8", errors="replace")
-        if text:
-            self.collector_output.append(f"<pre>{self._html_escape(text.rstrip())}</pre>")
+    def pause_collector(self) -> None:
+        result = self._run_cli_command("pause")
+        self._append_cli_result("Pause collector", result)
+        self.refresh_all(prefer_running_session=True)
 
-    def _collector_finished(self) -> None:
-        self.collector_output.append("Collector stopped.")
-        self.collector_process = None
-        self.start_record_button.setEnabled(True)
-        self.stop_record_button.setEnabled(False)
-        self.refresh_all()
+    def resume_collector(self) -> None:
+        result = self._run_cli_command("resume")
+        self._append_cli_result("Resume collector", result)
+        self.refresh_all(prefer_running_session=True)
+
+    def stop_collector_process(self, *, force: bool = False) -> None:
+        if force:
+            reply = QMessageBox.question(
+                self,
+                "Force stop collector",
+                "Force stop sends SIGKILL. The active session may remain open until recover is run. Continue?",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        args = ["stop", "--timeout", "5"]
+        if force:
+            args.append("--force")
+        result = self._run_cli_command(*args)
+        self._append_cli_result("Force stop collector" if force else "Stop collector", result)
+        self.refresh_all(prefer_running_session=True)
+
+    def _run_cli_command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "battery_auditor.cli",
+                "--db",
+                str(self.cfg.resolved_db_path()),
+                "--sysfs",
+                str(self.cfg.sysfs_power_supply_dir),
+                *args,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+    def _append_cli_result(self, title: str, result: subprocess.CompletedProcess[str]) -> None:
+        output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+        if not output:
+            output = f"{title}: exit code {result.returncode}"
+        self.collector_output.append(self._format_service_output(title, result.returncode, output))
+        if result.returncode != 0:
+            QMessageBox.warning(self, title, output)
 
     def start_blackbox_service(self) -> None:
         if not self.db_available:
@@ -671,12 +799,13 @@ class MainWindow(QMainWindow):
         self.tlp_output.setPlainText(result.combined_output())
 
     def repair_database_from_ui(self) -> None:
-        active = self._active_heartbeat_files()
-        if active:
+        status = collect_runtime_status(self.cfg, self.db if self.db_available else None)
+        active = status.to_dict().get("active_heartbeat_files", [])
+        if status.state in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN} or active:
             QMessageBox.warning(
                 self,
                 "Repair database",
-                "A collector appears to be running. Stop the collector before repairing the database.\n\n"
+                "A collector appears to be active or ambiguous. Stop it before repairing the database.\n\n"
                 + "\n".join(str(path) for path in active[:5]),
             )
             return
@@ -703,6 +832,8 @@ class MainWindow(QMainWindow):
 
         self.db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
         self.db.init_schema()
+        if hasattr(self, "sessions_manager"):
+            self.sessions_manager.db = self.db
         self.db_available = True
         self.db_error = None
         self.db_status_label.setText(
@@ -728,21 +859,6 @@ class MainWindow(QMainWindow):
             f"Path: {self.cfg.resolved_db_path()}\n"
             "Live status can still be refreshed, but recorded sessions are disabled until the database is repaired or moved aside."
         )
-
-    def _active_heartbeat_files(self) -> list[Path]:
-        heartbeat_dir = self.cfg.heartbeat_dir()
-        if not heartbeat_dir.exists():
-            return []
-        max_age = max(30.0, self.cfg.heartbeat_seconds * 5)
-        now = time.time()
-        active: list[Path] = []
-        for path in heartbeat_dir.glob("*.json"):
-            try:
-                if now - path.stat().st_mtime <= max_age:
-                    active.append(path)
-            except OSError:
-                continue
-        return sorted(active)
 
 
 def main() -> int:

@@ -14,6 +14,7 @@ Its main goal is not to save battery power, but to **diagnose batteries without 
 - Manual TLP wrapper: `tlp-stat`, `setcharge`, `recalibrate`.
 - User-level systemd services.
 - CSV/JSON export for external analysis.
+- Collector status, pause/resume/stop control, and session management.
 
 ## Non-invasive design
 
@@ -23,7 +24,7 @@ The collector does not run `tlp-stat`, `upower`, `acpi`, `journalctl`, or any ot
 2. derived metric calculations;
 3. compact row inserts into SQLite.
 
-The UI is optional. For a serious discharge test, it is better to close the UI and leave only the collector or systemd service running.
+The Qt UI is a viewer/controller, not the owner of the collector. Closing the UI does not mean "stop measuring". For a serious discharge test, it is still best to leave only the collector or systemd service running and reopen the UI when you want to inspect or control it.
 
 ## Installation on Debian 13 / modern Linux
 
@@ -58,6 +59,27 @@ Record a diagnostic session:
 battery-auditor collect --mode diagnostic --name normal-discharge
 ```
 
+Show collector status:
+
+```bash
+battery-auditor status
+battery-auditor status --json
+```
+
+Pause, resume, or stop the collector:
+
+```bash
+battery-auditor pause
+battery-auditor resume
+battery-auditor stop
+```
+
+Use force stop only when normal stop cannot work:
+
+```bash
+battery-auditor stop --force
+```
+
 Record in black-box mode:
 
 ```bash
@@ -68,6 +90,25 @@ List sessions:
 
 ```bash
 battery-auditor sessions
+```
+
+Rename or annotate a session:
+
+```bash
+battery-auditor rename-session <session_id> --name "post-recalibration run"
+battery-auditor note-session <session_id> --notes "BAT1 drained faster after 40%."
+```
+
+Merge sessions into a synthetic session:
+
+```bash
+battery-auditor merge-sessions <id1> <id2> --name "merged-test"
+```
+
+Delete a session and its dependent rows:
+
+```bash
+battery-auditor delete-session <session_id>
 ```
 
 Analyze the latest session:
@@ -87,6 +128,22 @@ Open the UI:
 ```bash
 battery-auditor-qt
 ```
+
+## Collector lifecycle
+
+Battery Auditor keeps collector runtime state under the configured data directory:
+
+- `collector.lock` records the active collector PID and is protected with an advisory lock;
+- `heartbeats/*.json` records lightweight current-session state, including paused state, last seq, and heartbeat time;
+- `collector.control.json` is the low-cost pause/resume control file checked by the collector between samples.
+
+`battery-auditor status` combines the lock, PID liveness, heartbeat files, and open SQLite sessions. It reports `RUNNING`, `PAUSED`, `STOPPED`, `STALE`, or `UNKNOWN`.
+
+The Qt Recording tab uses the same CLI/runtime layer as the terminal. It can detect and control collectors started by CLI, systemd, or a previous UI instance. When the UI starts a collector, it starts a detached CLI process and writes output to `collector-ui.log` in the data directory. The collector keeps running after the Qt window closes.
+
+While paused, the collector does not sample `/sys/class/power_supply` and does not insert normal samples. It updates a lightweight heartbeat and records `SESSION_PAUSED` / `SESSION_RESUMED` events.
+
+Delete, merge, recover, and repair operations refuse to run while an active or ambiguous collector may be writing. Merging creates a new session, keeps source sessions untouched, preserves original wall-clock sample times, renumbers merged sample seq values from zero, and records provenance events.
 
 ## Black-box mode
 
@@ -113,6 +170,8 @@ battery-auditor analyze
 
 The exact shutdown instant cannot be measured after the machine loses power, but it can be bracketed by the last persisted heartbeat/sample and the configured interval.
 
+Normal `battery-auditor stop` sends `SIGTERM`, allowing the collector to end the session with `signal_or_user_stop`. Force stop sends `SIGKILL` and can leave the session open because the collector cannot run its clean shutdown path. Use `battery-auditor recover` after reboot or after a force stop if a session remains open.
+
 ## User systemd services
 
 Install units:
@@ -132,6 +191,8 @@ Start a black-box session under systemd:
 ```bash
 systemctl --user start battery-auditor-blackbox.service
 ```
+
+The UI and `battery-auditor status` detect these systemd-started collectors through the same lock and heartbeat files.
 
 View logs:
 
@@ -209,6 +270,21 @@ source .venv/bin/activate
 python -m pip install -e '.[ui,dev]'
 pytest
 ruff check .
+```
+
+## Manual lifecycle validation
+
+```bash
+battery-auditor collect --mode diagnostic --name cli-test
+battery-auditor status --json
+battery-auditor pause
+battery-auditor status
+battery-auditor resume
+battery-auditor stop
+battery-auditor sessions
+battery-auditor-qt
+battery-auditor merge-sessions <id1> <id2> --name "merged-test"
+battery-auditor export <merged_id> --format csv --out merged.csv
 ```
 
 ## Project status

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import os
 import signal
 import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TextIO
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.database import BatteryDatabase
 from battery_auditor.core.events import EventDetector
 from battery_auditor.core.models import Event, SystemSnapshot
+from battery_auditor.core.runtime import (
+    control_path,
+    lock_path,
+    read_control_state,
+    remove_heartbeat,
+    write_control_state,
+    write_heartbeat,
+    write_lock_payload,
+)
 from battery_auditor.core.sysfs import read_process_metrics, read_snapshot
 
 
@@ -30,7 +38,9 @@ class BatteryCollector:
         self.db = db or BatteryDatabase(cfg.resolved_db_path(), cfg)
         self.stop_requested = False
         self.detector = EventDetector(cfg)
-        self._lock_file: object | None = None
+        self._lock_file: TextIO | None = None
+        self._control_mtime_ns: int | None = None
+        self._pause_requested = False
 
     def request_stop(self, *_args: object) -> None:
         self.stop_requested = True
@@ -55,6 +65,7 @@ class BatteryCollector:
         self.cfg.heartbeat_dir().mkdir(parents=True, exist_ok=True)
         self._acquire_collector_lock()
         try:
+            write_control_state(self.cfg, paused=False)
             self.db.init_schema()
             integrity = self.db.check_integrity(quick=True)
             if integrity != ["ok"]:
@@ -70,14 +81,48 @@ class BatteryCollector:
 
             reason = "stopped"
             seq = 0
+            paused = False
             started_mono = time.monotonic()
             next_deadline = started_mono
+            last_heartbeat_wall = 0.0
             try:
                 while not self.stop_requested:
                     now_mono = time.monotonic()
                     if duration_seconds is not None and now_mono - started_mono >= duration_seconds:
                         reason = "duration_elapsed"
                         break
+                    pause_requested = self._read_pause_requested()
+                    if pause_requested != paused:
+                        paused = pause_requested
+                        self._record_pause_transition(session_id, paused)
+                        if blackbox or self.cfg.blackbox_flush_each_sample:
+                            self.db.flush_to_disk()
+                        if not paused:
+                            self.detector = EventDetector(self.cfg)
+                            next_deadline = time.monotonic()
+                    if paused:
+                        heartbeat_interval = max(0.5, float(self.cfg.heartbeat_seconds))
+                        now_wall = time.time()
+                        if now_wall - last_heartbeat_wall >= heartbeat_interval:
+                            self.db.update_heartbeat(
+                                session_id,
+                                now_wall,
+                                self._wall_iso(now_wall),
+                                time.monotonic(),
+                            )
+                            self._write_heartbeat_file(
+                                session_id,
+                                seq - 1,
+                                sample_count=seq,
+                                paused=True,
+                                wall_time=now_wall,
+                                monotonic_time=time.monotonic(),
+                            )
+                            last_heartbeat_wall = now_wall
+                            if blackbox or self.cfg.blackbox_flush_each_sample:
+                                self.db.flush_to_disk()
+                        time.sleep(min(1.0, heartbeat_interval))
+                        continue
                     if now_mono < next_deadline:
                         time.sleep(min(0.25, next_deadline - now_mono))
                         continue
@@ -87,7 +132,14 @@ class BatteryCollector:
                     events = self.detector.process(snap)
                     self.db.insert_snapshot(session_id, seq, snap, events)
                     self.db.update_heartbeat(session_id, snap.wall_time, snap.wall_iso, snap.monotonic_time)
-                    self._write_heartbeat_file(session_id, seq, snap)
+                    self._write_heartbeat_file(
+                        session_id,
+                        seq,
+                        sample_count=seq + 1,
+                        paused=False,
+                        snap=snap,
+                    )
+                    last_heartbeat_wall = snap.wall_time
 
                     if blackbox or self.cfg.blackbox_flush_each_sample:
                         self.db.flush_to_disk()
@@ -118,6 +170,8 @@ class BatteryCollector:
                 with suppress(Exception):
                     self.db.end_session(session_id, reason=reason)
                 self._remove_heartbeat_file(session_id)
+                with suppress(Exception):
+                    write_control_state(self.cfg, paused=False)
                 if blackbox or self.cfg.blackbox_flush_each_sample:
                     with suppress(Exception):
                         self.db.flush_to_disk()
@@ -138,41 +192,87 @@ class BatteryCollector:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         return f"{timestamp}-{uuid.uuid4().hex[:8]}"
 
-    def _heartbeat_path(self, session_id: str) -> Path:
-        return self.cfg.heartbeat_dir() / f"{session_id}.json"
-
-    def _write_heartbeat_file(self, session_id: str, seq: int, snap: SystemSnapshot) -> None:
-        path = self._heartbeat_path(session_id)
-        tmp_path = path.with_suffix(".json.tmp")
-        payload = {
-            "session_id": session_id,
-            "seq": seq,
-            "wall_time": snap.wall_time,
-            "wall_iso": snap.wall_iso,
-            "monotonic_time": snap.monotonic_time,
-            "ac_online": snap.ac_online,
-            "total_computed_percent": snap.total_computed_percent,
-            "total_energy_now_uwh": snap.total_energy_now_uwh,
-        }
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        tmp_path.replace(path)
+    def _write_heartbeat_file(
+        self,
+        session_id: str,
+        last_seq: int,
+        *,
+        sample_count: int,
+        paused: bool,
+        snap: SystemSnapshot | None = None,
+        wall_time: float | None = None,
+        monotonic_time: float | None = None,
+    ) -> None:
+        if snap is not None:
+            wall_time = snap.wall_time
+            monotonic_time = snap.monotonic_time
+            extra = {
+                "ac_online": snap.ac_online,
+                "total_computed_percent": snap.total_computed_percent,
+                "total_energy_now_uwh": snap.total_energy_now_uwh,
+            }
+        else:
+            extra = {}
+        write_heartbeat(
+            self.cfg,
+            session_id=session_id,
+            pid=os.getpid(),
+            paused=paused,
+            sample_count=sample_count,
+            last_seq=last_seq,
+            wall_time=wall_time if wall_time is not None else time.time(),
+            monotonic_time=monotonic_time if monotonic_time is not None else time.monotonic(),
+            extra=extra,
+        )
 
     def _remove_heartbeat_file(self, session_id: str) -> None:
-        with suppress(FileNotFoundError):
-            self._heartbeat_path(session_id).unlink()
+        remove_heartbeat(self.cfg, session_id)
+
+    def _read_pause_requested(self) -> bool:
+        path = control_path(self.cfg)
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            self._control_mtime_ns = None
+            self._pause_requested = False
+            return False
+        except OSError:
+            return self._pause_requested
+        if self._control_mtime_ns == mtime_ns:
+            return self._pause_requested
+        self._control_mtime_ns = mtime_ns
+        state = read_control_state(self.cfg)
+        self._pause_requested = state.paused if state.parse_error is None else self._pause_requested
+        return self._pause_requested
+
+    def _record_pause_transition(self, session_id: str, paused: bool) -> None:
+        now = time.time()
+        self.db.insert_event(
+            session_id,
+            Event(
+                "SESSION_PAUSED" if paused else "SESSION_RESUMED",
+                "info",
+                "Collector paused by user request." if paused else "Collector resumed by user request.",
+                wall_time=now,
+                monotonic_time=time.monotonic(),
+            ),
+        )
+
+    @staticmethod
+    def _wall_iso(timestamp: float) -> str:
+        from battery_auditor.core.models import wall_iso_from_timestamp
+
+        return wall_iso_from_timestamp(timestamp)
 
     def _acquire_collector_lock(self) -> None:
-        lock_path = self.cfg.data_dir / "collector.lock"
-        lock_file = lock_path.open("w", encoding="utf-8")
+        path = lock_path(self.cfg)
+        lock_file = path.open("a+", encoding="utf-8")
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             lock_file.close()
-            raise RuntimeError(f"Another Battery Auditor collector is already running: {lock_path}") from exc
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write(str(os.getpid()))
-        lock_file.flush()
+            raise RuntimeError(f"Another Battery Auditor collector is already running: {path}") from exc
+        write_lock_payload(lock_file)
         self._lock_file = lock_file
 
     def _release_collector_lock(self) -> None:
@@ -184,3 +284,5 @@ class BatteryCollector:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         with suppress(OSError):
             lock_file.close()
+        with suppress(OSError):
+            lock_path(self.cfg).unlink()

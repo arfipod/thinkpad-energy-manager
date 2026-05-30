@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,14 @@ from battery_auditor.core.analyzer import (
 )
 from battery_auditor.core.collector import BatteryCollector
 from battery_auditor.core.database import BatteryDatabase, repair_database
+from battery_auditor.core.runtime import (
+    STATUS_PAUSED,
+    STATUS_RUNNING,
+    STATUS_UNKNOWN,
+    collect_runtime_status,
+    stop_collector,
+    write_control_state,
+)
 from battery_auditor.core.sysfs import read_snapshot
 from battery_auditor.core.tlp import TlpClient
 
@@ -45,8 +55,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--no-recover", action="store_true", help="Do not mark previous open sessions as interrupted.")
 
+    status = sub.add_parser("status", help="Show collector runtime status.")
+    status.add_argument("--json", action="store_true", help="Print a stable JSON status payload.")
+
+    stop = sub.add_parser("stop", help="Stop the active collector.")
+    stop.add_argument("--force", action="store_true", help="Send SIGKILL instead of SIGTERM. Dangerous.")
+    stop.add_argument("--timeout", type=float, default=5.0, help="Seconds to wait for the collector to exit.")
+
+    sub.add_parser("pause", help="Pause the active collector without ending the session.")
+    sub.add_parser("resume", help="Resume a paused collector.")
+
     sessions = sub.add_parser("sessions", help="List recording sessions.")
     sessions.add_argument("--limit", type=int, default=50)
+
+    delete_session = sub.add_parser("delete-session", help="Delete one session and its dependent rows.")
+    delete_session.add_argument("session_id")
+
+    rename_session = sub.add_parser("rename-session", help="Rename a session.")
+    rename_session.add_argument("session_id")
+    rename_session.add_argument("--name", required=True)
+
+    note_session = sub.add_parser("note-session", help="Replace a session's notes.")
+    note_session.add_argument("session_id")
+    note_session.add_argument("--notes", required=True)
+
+    merge_sessions = sub.add_parser("merge-sessions", help="Merge source sessions into a new synthetic session.")
+    merge_sessions.add_argument("session_ids", nargs="+")
+    merge_sessions.add_argument("--name", required=True)
+    merge_sessions.add_argument("--id", dest="merged_session_id", help="Optional merged session id.")
 
     analyze = sub.add_parser("analyze", help="Analyze a session.")
     analyze.add_argument("session_id", nargs="?", help="Defaults to latest session.")
@@ -99,6 +135,17 @@ def db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase:
     return db
 
 
+def status_db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase | None:
+    if not cfg.resolved_db_path().exists():
+        return None
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+    try:
+        db.init_schema()
+    except Exception:  # noqa: BLE001 - runtime status should survive a damaged DB
+        return None
+    return db
+
+
 def command_once(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     snap = read_snapshot(cfg.sysfs_power_supply_dir)
     if args.json:
@@ -139,6 +186,49 @@ def command_collect(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     return 0
 
 
+def command_status(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = status_db_from_cfg(cfg)
+    status = collect_runtime_status(cfg, db)
+    if args.json:
+        print(json.dumps(status.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(_format_status_text(status.to_dict()))
+    return 0
+
+
+def command_stop(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    result = stop_collector(cfg, force=args.force, timeout_seconds=args.timeout)
+    print(result.message)
+    if result.ok:
+        return 0
+    return 2 if result.unsafe else 1
+
+
+def command_pause(_args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = status_db_from_cfg(cfg)
+    status = collect_runtime_status(cfg, db)
+    if status.state == STATUS_PAUSED:
+        print("Collector is already paused.")
+        return 0
+    if not (status.state == STATUS_RUNNING and status.lock.held and status.pid_alive and status.pid_is_collector):
+        print(f"No running collector can be paused (state={status.state}).", file=sys.stderr)
+        return 1
+    write_control_state(cfg, paused=True)
+    print("Pause requested.")
+    return 0
+
+
+def command_resume(_args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    status = collect_runtime_status(cfg, status_db_from_cfg(cfg))
+    if status.state != STATUS_PAUSED and not status.control.paused:
+        write_control_state(cfg, paused=False)
+        print("Collector is not paused. Pause state is clear.")
+        return 0
+    write_control_state(cfg, paused=False)
+    print("Resume requested.")
+    return 0
+
+
 def command_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     db = db_from_cfg(cfg)
     rows = db.list_sessions(limit=args.limit)
@@ -152,6 +242,66 @@ def command_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
             f"{row['id']} | {row['started_at_iso']} → {row['ended_at_iso'] or 'open'} | "
             f"samples={row['sample_count']} | {status}{loss} | {row['name'] or ''}"
         )
+    return 0
+
+
+def command_delete_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to delete sessions while an active collector may be writing.", file=sys.stderr)
+        return 2
+    db = db_from_cfg(cfg)
+    if db.delete_session(args.session_id):
+        print(f"Deleted session {args.session_id}.")
+        return 0
+    print(f"Unknown session: {args.session_id}", file=sys.stderr)
+    return 2
+
+
+def command_rename_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = db_from_cfg(cfg)
+    if _session_is_active_collector_session(cfg, db, args.session_id):
+        print("Refusing to rename the active running collector session.", file=sys.stderr)
+        return 2
+    if db.rename_session(args.session_id, args.name):
+        print(f"Renamed session {args.session_id}.")
+        return 0
+    print(f"Unknown session: {args.session_id}", file=sys.stderr)
+    return 2
+
+
+def command_note_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = db_from_cfg(cfg)
+    if _session_is_active_collector_session(cfg, db, args.session_id):
+        print("Refusing to edit notes on the active running collector session.", file=sys.stderr)
+        return 2
+    if db.update_session_notes(args.session_id, args.notes):
+        print(f"Updated notes for session {args.session_id}.")
+        return 0
+    print(f"Unknown session: {args.session_id}", file=sys.stderr)
+    return 2
+
+
+def command_merge_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to merge sessions while an active collector may be writing.", file=sys.stderr)
+        return 2
+    db = db_from_cfg(cfg)
+    open_ids = {str(row["id"]) for row in db.list_open_sessions()}
+    selected_open = [session_id for session_id in args.session_ids if session_id in open_ids]
+    if selected_open:
+        print(
+            "Refusing to merge open session(s). Run recover first if the collector is no longer alive: "
+            + ", ".join(selected_open),
+            file=sys.stderr,
+        )
+        return 2
+    merged_id = args.merged_session_id or _new_merged_session_id()
+    try:
+        db.merge_sessions(list(args.session_ids), merged_id, args.name)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"Merged {len(args.session_ids)} session(s) into {merged_id}.")
     return 0
 
 
@@ -184,6 +334,9 @@ def command_export(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_recover(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to recover open sessions while an active collector may be writing.", file=sys.stderr)
+        return 2
     db = db_from_cfg(cfg)
     recovered = db.recover_open_sessions(reason=args.reason)
     if recovered:
@@ -196,6 +349,9 @@ def command_recover(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_repair_db(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to repair the database while an active collector may be writing.", file=sys.stderr)
+        return 2
     result = repair_database(cfg.resolved_db_path(), output_path=args.out, replace=args.replace)
     print(f"Source: {result.source_path}")
     print(f"Repaired: {result.repaired_path}")
@@ -243,7 +399,15 @@ def main(argv: list[str] | None = None) -> int:
     commands: dict[str, Any] = {
         "once": command_once,
         "collect": command_collect,
+        "status": command_status,
+        "stop": command_stop,
+        "pause": command_pause,
+        "resume": command_resume,
         "sessions": command_sessions,
+        "delete-session": command_delete_session,
+        "rename-session": command_rename_session,
+        "note-session": command_note_session,
+        "merge-sessions": command_merge_sessions,
         "analyze": command_analyze,
         "export": command_export,
         "recover": command_recover,
@@ -271,6 +435,43 @@ def _uw_to_w(value: int | None) -> float:
 
 def _uv_to_v(value: int | None) -> float:
     return 0.0 if value is None else value / 1_000_000.0
+
+
+def _format_status_text(payload: dict[str, Any]) -> str:
+    session = payload.get("current_session_id") or "none"
+    name = payload.get("current_session_name")
+    if name:
+        session = f"{session} ({name})"
+    age = payload.get("last_heartbeat_age_seconds")
+    heartbeat = "none" if age is None else f"{float(age):.1f}s ago"
+    lines = [
+        f"Collector: {payload['state']}",
+        f"PID: {payload.get('pid') or 'none'} alive={payload.get('pid_alive')} verified={payload.get('pid_is_collector')}",
+        f"Session: {session}",
+        f"Heartbeat: {heartbeat}",
+        f"Samples: {payload.get('sample_count') if payload.get('sample_count') is not None else 'unknown'}",
+        f"Open DB sessions: {payload.get('open_session_count', 0)}",
+    ]
+    warnings = payload.get("warnings") or []
+    lines.extend(f"Warning: {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def _active_collector_may_be_writing(cfg: AuditorConfig) -> bool:
+    status = collect_runtime_status(cfg, status_db_from_cfg(cfg))
+    return status.state in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN}
+
+
+def _session_is_active_collector_session(cfg: AuditorConfig, db: BatteryDatabase, session_id: str) -> bool:
+    session = db.get_session(session_id)
+    if session is None or session["ended_at_wall"] is not None:
+        return False
+    status = collect_runtime_status(cfg, db)
+    return status.state in {STATUS_RUNNING, STATUS_PAUSED, STATUS_UNKNOWN} and status.current_session_id == session_id
+
+
+def _new_merged_session_id() -> str:
+    return f"merged-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
 if __name__ == "__main__":

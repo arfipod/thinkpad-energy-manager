@@ -443,13 +443,19 @@ class BatteryDatabase:
         return list(
             conn.execute(
                 """
-                SELECT id, name, started_at_iso, ended_at_iso, ended_reason,
-                       probable_power_loss, sample_count, last_heartbeat_iso,
+                SELECT id, name, started_at_wall, started_at_iso, ended_at_wall, ended_at_iso, ended_reason,
+                       probable_power_loss, sample_count, last_heartbeat_wall, last_heartbeat_iso,
+                       notes,
                        (
                          SELECT MAX(wall_iso)
                            FROM samples
                           WHERE samples.session_id = sessions.id
                        ) AS last_sample_iso,
+                       (
+                         SELECT MAX(wall_time)
+                           FROM samples
+                          WHERE samples.session_id = sessions.id
+                       ) AS last_sample_wall,
                        (
                          SELECT COUNT(*)
                            FROM samples
@@ -472,7 +478,60 @@ class BatteryDatabase:
         conn = self.connect()
         return cast(sqlite3.Row | None, conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone())
 
-    def fetch_session_series(self, session_id: str, limit: int | None = None) -> list[sqlite3.Row]:
+    def list_open_sessions(self) -> list[sqlite3.Row]:
+        conn = self.connect()
+        return list(
+            conn.execute(
+                """
+                SELECT id, name, started_at_wall, started_at_iso, ended_at_wall, ended_at_iso,
+                       ended_reason, probable_power_loss, sample_count, last_heartbeat_wall,
+                       last_heartbeat_iso, notes,
+                       (
+                         SELECT MAX(wall_iso)
+                           FROM samples
+                          WHERE samples.session_id = sessions.id
+                       ) AS last_sample_iso,
+                       (
+                         SELECT MAX(wall_time)
+                           FROM samples
+                          WHERE samples.session_id = sessions.id
+                       ) AS last_sample_wall,
+                       (
+                         SELECT COUNT(*)
+                           FROM samples
+                          WHERE samples.session_id = sessions.id
+                       ) AS real_sample_count
+                  FROM sessions
+                 WHERE ended_at_wall IS NULL
+                 ORDER BY started_at_wall DESC
+                """
+            )
+        )
+
+    def delete_session(self, session_id: str) -> bool:
+        conn = self.connect()
+        cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+    def rename_session(self, session_id: str, name: str) -> bool:
+        conn = self.connect()
+        cur = conn.execute("UPDATE sessions SET name = ? WHERE id = ?", (name, session_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+    def update_session_notes(self, session_id: str, notes: str) -> bool:
+        conn = self.connect()
+        cur = conn.execute("UPDATE sessions SET notes = ? WHERE id = ?", (notes, session_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+    def fetch_session_series(
+        self,
+        session_id: str,
+        limit: int | None = None,
+        after_seq: int | None = None,
+    ) -> list[sqlite3.Row]:
         conn = self.connect()
         sql = """
             SELECT s.seq, s.wall_time, s.wall_iso, s.monotonic_time, s.ac_online,
@@ -484,13 +543,16 @@ class BatteryDatabase:
               FROM samples s
               JOIN sample_batteries b ON b.sample_id = s.id
              WHERE s.session_id = ?
-             ORDER BY s.seq ASC, b.name ASC
         """
-        params: tuple[Any, ...] = (session_id,)
+        params_list: list[Any] = [session_id]
+        if after_seq is not None:
+            sql += " AND s.seq > ?"
+            params_list.append(after_seq)
+        sql += " ORDER BY s.seq ASC, b.name ASC"
         if limit is not None:
             sql += " LIMIT ?"
-            params = (session_id, limit)
-        return list(conn.execute(sql, params))
+            params_list.append(limit)
+        return list(conn.execute(sql, tuple(params_list)))
 
     def fetch_events(self, session_id: str, limit: int = 500) -> list[sqlite3.Row]:
         conn = self.connect()
@@ -509,6 +571,253 @@ class BatteryDatabase:
 
     def export_rows(self, session_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.fetch_session_series(session_id)]
+
+    def merge_sessions(self, source_session_ids: list[str], merged_session_id: str, name: str) -> str:
+        from battery_auditor.core.models import wall_iso_from_timestamp
+
+        source_ids = list(dict.fromkeys(source_session_ids))
+        if not source_ids:
+            raise ValueError("At least one source session is required.")
+        conn = self.connect()
+        if self.get_session(merged_session_id) is not None:
+            raise ValueError(f"Session already exists: {merged_session_id}")
+
+        placeholders = ", ".join("?" for _ in source_ids)
+        source_rows = list(conn.execute(f"SELECT * FROM sessions WHERE id IN ({placeholders})", tuple(source_ids)))
+        by_id = {str(row["id"]): row for row in source_rows}
+        missing = [session_id for session_id in source_ids if session_id not in by_id]
+        if missing:
+            raise ValueError(f"Unknown source session(s): {', '.join(missing)}")
+
+        sample_rows: list[sqlite3.Row] = []
+        for session_id in source_ids:
+            sample_rows.extend(
+                conn.execute("SELECT * FROM samples WHERE session_id = ?", (session_id,)).fetchall()
+            )
+        source_order = {session_id: index for index, session_id in enumerate(source_ids)}
+        sample_rows.sort(
+            key=lambda row: (
+                float(row["wall_time"]),
+                source_order.get(str(row["session_id"]), 0),
+                int(row["seq"]),
+                int(row["id"]),
+            )
+        )
+
+        now = time.time()
+        started_wall_values = [float(row["started_at_wall"]) for row in source_rows]
+        started_wall = min(started_wall_values) if started_wall_values else now
+        ended_candidates = [
+            float(row["ended_at_wall"])
+            for row in source_rows
+            if row["ended_at_wall"] is not None
+        ] + [float(row["wall_time"]) for row in sample_rows]
+        ended_wall = max(ended_candidates) if ended_candidates else started_wall
+        last_heartbeat_candidates = [
+            float(row["last_heartbeat_wall"])
+            for row in source_rows
+            if row["last_heartbeat_wall"] is not None
+        ]
+        last_heartbeat_wall = max(last_heartbeat_candidates) if last_heartbeat_candidates else None
+        last_heartbeat_iso = wall_iso_from_timestamp(last_heartbeat_wall) if last_heartbeat_wall is not None else None
+        probable_power_loss = 1 if any(int(row["probable_power_loss"]) for row in source_rows) else 0
+        config_json = json.dumps(
+            {
+                "synthetic": True,
+                "merged_from": source_ids,
+                "created_at_iso": wall_iso_from_timestamp(now),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        system_json = json.dumps(
+            {
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+                "synthetic": True,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                  id, name, hostname, kernel, started_at_wall, started_at_iso,
+                  started_at_monotonic, ended_at_wall, ended_at_iso, ended_reason,
+                  probable_power_loss, last_heartbeat_wall, last_heartbeat_iso,
+                  last_heartbeat_monotonic, sample_count, config_json, system_json, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
+                """,
+                (
+                    merged_session_id,
+                    name,
+                    platform.node(),
+                    platform.release(),
+                    started_wall,
+                    wall_iso_from_timestamp(started_wall),
+                    min(float(row["started_at_monotonic"]) for row in source_rows),
+                    ended_wall,
+                    wall_iso_from_timestamp(ended_wall),
+                    "merged",
+                    probable_power_loss,
+                    last_heartbeat_wall,
+                    last_heartbeat_iso,
+                    config_json,
+                    system_json,
+                    f"Merged from: {', '.join(source_ids)}",
+                ),
+            )
+
+            sample_id_map: dict[int, int] = {}
+            for new_seq, sample in enumerate(sample_rows):
+                new_sample_id = self._copy_sample(conn, sample, merged_session_id, new_seq)
+                sample_id_map[int(sample["id"])] = new_sample_id
+                self._copy_sample_children(conn, "sample_batteries", int(sample["id"]), new_sample_id, merged_session_id)
+                self._copy_sample_children(conn, "power_supplies", int(sample["id"]), new_sample_id, merged_session_id)
+
+            self._copy_merged_events(conn, source_ids, merged_session_id, sample_id_map)
+            conn.execute(
+                "UPDATE sessions SET sample_count = (SELECT COUNT(*) FROM samples WHERE session_id = ?) WHERE id = ?",
+                (merged_session_id, merged_session_id),
+            )
+            self._insert_event(
+                conn,
+                merged_session_id,
+                Event(
+                    "SESSION_MERGED",
+                    "info",
+                    f"Merged from sessions: {', '.join(source_ids)}.",
+                    wall_time=now,
+                    monotonic_time=time.monotonic(),
+                    details={"source_session_ids": source_ids},
+                ),
+            )
+            overlap_details = self._merge_overlap_details(conn, source_ids)
+            if overlap_details:
+                self._insert_event(
+                    conn,
+                    merged_session_id,
+                    Event(
+                        "SESSION_MERGE_OVERLAP_WARNING",
+                        "warning",
+                        "Source sessions have overlapping wall-clock ranges. Times were preserved.",
+                        wall_time=now,
+                        monotonic_time=time.monotonic(),
+                        details=overlap_details,
+                    ),
+                )
+        return merged_session_id
+
+    def _copy_sample(
+        self,
+        conn: sqlite3.Connection,
+        sample: sqlite3.Row,
+        merged_session_id: str,
+        new_seq: int,
+    ) -> int:
+        columns = [
+            "session_id",
+            "seq",
+            "wall_time",
+            "wall_iso",
+            "monotonic_time",
+            "ac_online",
+            "total_energy_now_uwh",
+            "total_energy_full_uwh",
+            "total_energy_full_design_uwh",
+            "total_power_now_uw",
+            "total_computed_percent",
+            "total_health_percent",
+            "active_batteries",
+            "sample_duration_ms",
+            "db_write_duration_ms",
+            "collector_rss_kib",
+            "collector_user_cpu_seconds",
+            "collector_system_cpu_seconds",
+            "loop_delay_ms",
+            "created_at_wall",
+        ]
+        values = [
+            merged_session_id if column == "session_id" else new_seq if column == "seq" else sample[column]
+            for column in columns
+        ]
+        cur = conn.execute(
+            f"INSERT INTO samples ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            values,
+        )
+        assert cur.lastrowid is not None
+        return int(cur.lastrowid)
+
+    def _copy_sample_children(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        old_sample_id: int,
+        new_sample_id: int,
+        merged_session_id: str,
+    ) -> None:
+        columns = [str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})") if row["name"] != "id"]
+        insert_sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})"
+        for row in conn.execute(f"SELECT * FROM {table} WHERE sample_id = ? ORDER BY id ASC", (old_sample_id,)):
+            values = [
+                new_sample_id if column == "sample_id" else merged_session_id if column == "session_id" else row[column]
+                for column in columns
+            ]
+            conn.execute(insert_sql, values)
+
+    def _copy_merged_events(
+        self,
+        conn: sqlite3.Connection,
+        source_session_ids: list[str],
+        merged_session_id: str,
+        sample_id_map: dict[int, int],
+    ) -> None:
+        columns = [str(row["name"]) for row in conn.execute("PRAGMA table_info(events)") if row["name"] != "id"]
+        insert_sql = f"INSERT INTO events ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})"
+        for session_id in source_session_ids:
+            events = conn.execute(
+                """
+                SELECT *
+                  FROM events
+                 WHERE session_id = ?
+                 ORDER BY COALESCE(wall_time, created_at_wall) ASC, id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            for event in events:
+                old_sample_id = event["sample_id"]
+                values = [
+                    merged_session_id
+                    if column == "session_id"
+                    else sample_id_map.get(int(old_sample_id))
+                    if column == "sample_id" and old_sample_id is not None
+                    else event[column]
+                    for column in columns
+                ]
+                conn.execute(insert_sql, values)
+
+    def _merge_overlap_details(self, conn: sqlite3.Connection, source_session_ids: list[str]) -> dict[str, Any] | None:
+        ranges: list[dict[str, Any]] = []
+        for session_id in source_session_ids:
+            row = conn.execute(
+                "SELECT MIN(wall_time) AS start_wall, MAX(wall_time) AS end_wall FROM samples WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["start_wall"] is None or row["end_wall"] is None:
+                continue
+            ranges.append({"session_id": session_id, "start_wall": row["start_wall"], "end_wall": row["end_wall"]})
+        overlaps: list[dict[str, Any]] = []
+        for left_index, left in enumerate(ranges):
+            for right in ranges[left_index + 1 :]:
+                if float(left["start_wall"]) <= float(right["end_wall"]) and float(right["start_wall"]) <= float(left["end_wall"]):
+                    overlaps.append({"left": left["session_id"], "right": right["session_id"]})
+        if not overlaps:
+            return None
+        return {"source_ranges": ranges, "overlaps": overlaps}
 
 
 def none_bool_to_int(value: bool | None) -> int | None:
