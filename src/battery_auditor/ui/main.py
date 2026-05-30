@@ -169,7 +169,7 @@ class MainWindow(QMainWindow):
         self.menuBar().addAction(refresh_action)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_live_snapshot)
+        self.timer.timeout.connect(self.refresh_all)
         self.timer.start(int(self.cfg.ui_refresh_seconds * 1000))
 
         self.refresh_all()
@@ -329,19 +329,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tlp_output)
         return widget
 
-    def refresh_all(self) -> None:
-        self.refresh_sessions()
+    def refresh_all(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
+        self.refresh_sessions(prefer_running_session=prefer_running_session)
         self.refresh_live_snapshot()
         self.refresh_chart()
         self.refresh_events()
 
-    def refresh_sessions(self) -> None:
+    def refresh_sessions(self, *, prefer_running_session: bool = False) -> None:
         if not self.db_available:
             self._show_database_error()
             if hasattr(self, "session_combo"):
                 self.session_combo.clear()
             return
         current = self.session_combo.currentData() if hasattr(self, "session_combo") else None
+        running_index: int | None = None
         self.session_combo.blockSignals(True)
         self.session_combo.clear()
         try:
@@ -351,16 +352,24 @@ class MainWindow(QMainWindow):
                 last_sample = row["last_sample_iso"] or "no samples"
                 label = f"{status} | {row['started_at_iso']} | {row['id']} | {sample_count} samples | last {last_sample}"
                 self.session_combo.addItem(label, row["id"])
+                if status == "running" and running_index is None:
+                    running_index = self.session_combo.count() - 1
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
             self.session_combo.clear()
             self.session_combo.blockSignals(False)
             self._show_database_error()
             return
-        if current:
+        if prefer_running_session and running_index is not None:
+            self.session_combo.setCurrentIndex(running_index)
+        elif current:
             index = self.session_combo.findData(current)
             if index >= 0:
                 self.session_combo.setCurrentIndex(index)
+            elif running_index is not None:
+                self.session_combo.setCurrentIndex(running_index)
+        elif running_index is not None:
+            self.session_combo.setCurrentIndex(running_index)
         self.session_combo.blockSignals(False)
 
     def refresh_live_snapshot(self) -> None:
@@ -397,8 +406,8 @@ class MainWindow(QMainWindow):
             grouped[str(row["battery_name"])].append((minutes, float(value)))
         self.chart.set_data(f"{metric} — {session_id}", metric, sorted(grouped.items()))
 
-    def refresh_sessions_and_chart(self) -> None:
-        self.refresh_sessions()
+    def refresh_sessions_and_chart(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
+        self.refresh_sessions(prefer_running_session=prefer_running_session)
         self.refresh_chart()
 
     def refresh_events(self) -> None:
@@ -540,19 +549,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Database unavailable", self._database_error_message())
             return
         result = self._run_systemctl("start", BLACKBOX_SERVICE)
-        self._append_systemctl_result("Start black-box service", result)
+        self._append_systemctl_result("Start black-box service", result, warn_on_failure=True)
         if result.returncode == 0:
-            self.refresh_sessions_and_chart()
+            self.refresh_all(prefer_running_session=True)
 
     def stop_blackbox_service(self) -> None:
         result = self._run_systemctl("stop", BLACKBOX_SERVICE)
-        self._append_systemctl_result("Stop black-box service", result)
+        self._append_systemctl_result("Stop black-box service", result, warn_on_failure=True)
         if result.returncode == 0:
             self.refresh_sessions_and_chart()
 
     def show_blackbox_service_status(self) -> None:
-        result = self._run_systemctl("status", "--no-pager", BLACKBOX_SERVICE)
-        self._append_systemctl_result("Black-box service status", result)
+        result = self._run_systemctl(
+            "show",
+            BLACKBOX_SERVICE,
+            "--no-pager",
+            "--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,ExecMainPID,MemoryCurrent,CPUUsageNSec,FragmentPath,DropInPaths",
+        )
+        self._append_systemctl_result("Black-box service status", result, warn_on_failure=True)
 
     def _run_systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -562,12 +576,18 @@ class MainWindow(QMainWindow):
             text=True,
         )
 
-    def _append_systemctl_result(self, title: str, result: subprocess.CompletedProcess[str]) -> None:
+    def _append_systemctl_result(
+        self,
+        title: str,
+        result: subprocess.CompletedProcess[str],
+        *,
+        warn_on_failure: bool,
+    ) -> None:
         output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
         if not output:
             output = f"{title}: exit code {result.returncode}"
         self.collector_output.append(self._format_service_output(title, result.returncode, output))
-        if result.returncode != 0:
+        if warn_on_failure and result.returncode != 0:
             QMessageBox.warning(
                 self,
                 title,
@@ -589,9 +609,14 @@ class MainWindow(QMainWindow):
     def _color_service_line(self, line: str) -> str:
         escaped = self._html_escape(line)
         lower = line.lower()
-        if "active: active (running)" in lower:
+        if "active: active (running)" in lower or lower == "activestate=active":
             return f'<span style="color:#22c55e">{escaped}</span>'
-        if "active: inactive" in lower or "active: deactivating" in lower:
+        if (
+            "active: inactive" in lower
+            or "active: deactivating" in lower
+            or lower == "activestate=inactive"
+            or lower == "substate=dead"
+        ):
             return f'<span style="color:#a3a3a3">{escaped}</span>'
         if "failed" in lower or "error" in lower or "database unavailable" in lower:
             return f'<span style="color:#ef4444">{escaped}</span>'
