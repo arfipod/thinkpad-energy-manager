@@ -28,6 +28,10 @@ def test_insert_and_fetch_session(tmp_path: Path) -> None:
     assert len(sessions) == 1
     rows = db.fetch_session_series("s1")
     assert len(rows) == 2
+    row_keys = rows[0].keys()
+    assert "system_cpu_percent" in row_keys
+    assert "system_memory_used_percent" in row_keys
+    assert "system_disk_write_bytes_per_second" in row_keys
 
 
 def test_init_schema_tolerates_locked_journal_mode_pragma(tmp_path: Path, monkeypatch: Any) -> None:
@@ -100,6 +104,90 @@ def test_reader_schema_init_does_not_reconfigure_journal(tmp_path: Path, monkeyp
     db.init_schema(configure_journal=False)
 
     assert db.check_integrity(quick=True) == ["ok"]
+
+
+def test_read_only_connection_cannot_write(tmp_path: Path) -> None:
+    cfg = AuditorConfig(data_dir=tmp_path, db_path=tmp_path / "test.sqlite3", sysfs_power_supply_dir=FIXTURE)
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+    db.init_schema()
+    db.start_session("s1", "test", cfg.to_json())
+    db.close()
+
+    reader = BatteryDatabase(cfg.resolved_db_path(), cfg, read_only=True)
+    reader.init_schema()
+
+    assert reader.latest_session_id() == "s1"
+    assert reader.connect().execute("PRAGMA query_only").fetchone()[0] == 1
+    try:
+        reader.rename_session("s1", "new-name")
+    except sqlite3.OperationalError as exc:
+        assert "readonly" in str(exc).lower() or "read-only" in str(exc).lower()
+    else:
+        raise AssertionError("read-only database connection accepted a write")
+
+
+def test_schema_migrates_v1_samples_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY);
+        CREATE TABLE samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            wall_time REAL NOT NULL,
+            wall_iso TEXT NOT NULL,
+            monotonic_time REAL NOT NULL,
+            ac_online INTEGER,
+            total_energy_now_uwh INTEGER,
+            total_energy_full_uwh INTEGER,
+            total_energy_full_design_uwh INTEGER,
+            total_power_now_uw INTEGER,
+            total_computed_percent REAL,
+            total_health_percent REAL,
+            active_batteries TEXT NOT NULL DEFAULT '[]',
+            sample_duration_ms REAL,
+            db_write_duration_ms REAL,
+            collector_rss_kib INTEGER,
+            collector_user_cpu_seconds REAL,
+            collector_system_cpu_seconds REAL,
+            loop_delay_ms REAL,
+            created_at_wall REAL NOT NULL,
+            UNIQUE(session_id, seq)
+        );
+        CREATE TABLE sample_batteries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE power_supplies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            wall_time REAL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+    cfg = AuditorConfig(data_dir=tmp_path, db_path=db_path, sysfs_power_supply_dir=FIXTURE)
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+    db.init_schema()
+
+    columns = {str(row["name"]) for row in db.connect().execute("PRAGMA table_info(samples)")}
+    assert "system_cpu_percent" in columns
+    assert "system_memory_available_kib" in columns
+    assert "system_disk_read_bytes_per_second" in columns
+    assert db.connect().execute("PRAGMA user_version").fetchone()[0] == 2
 
 
 def test_recover_open_session(tmp_path: Path) -> None:

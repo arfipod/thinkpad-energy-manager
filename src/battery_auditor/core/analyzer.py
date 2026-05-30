@@ -35,6 +35,10 @@ def summarize_session(db: BatteryDatabase, session_id: str) -> SessionSummary:
     per_battery_values: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     total_percent: list[float] = []
     total_power: list[float] = []
+    system_cpu: list[float] = []
+    system_memory: list[float] = []
+    system_disk_read: list[float] = []
+    system_disk_write: list[float] = []
     first_time: float | None = None
     last_time: float | None = None
 
@@ -54,6 +58,14 @@ def summarize_session(db: BatteryDatabase, session_id: str) -> SessionSummary:
             total_percent.append(float(row["total_computed_percent"]))
         if row["total_power_now_uw"] is not None:
             total_power.append(float(row["total_power_now_uw"]))
+        if row["system_cpu_percent"] is not None:
+            system_cpu.append(float(row["system_cpu_percent"]))
+        if row["system_memory_used_percent"] is not None:
+            system_memory.append(float(row["system_memory_used_percent"]))
+        if row["system_disk_read_bytes_per_second"] is not None:
+            system_disk_read.append(float(row["system_disk_read_bytes_per_second"]))
+        if row["system_disk_write_bytes_per_second"] is not None:
+            system_disk_write.append(float(row["system_disk_write_bytes_per_second"]))
 
     per_battery: dict[str, dict[str, Any]] = {}
     for battery, values in per_battery_values.items():
@@ -86,6 +98,10 @@ def summarize_session(db: BatteryDatabase, session_id: str) -> SessionSummary:
         total={
             "computed_percent": stats(total_percent),
             "power_now_uw": stats(total_power),
+            "system_cpu_percent": stats(system_cpu),
+            "system_memory_used_percent": stats(system_memory),
+            "system_disk_read_bytes_per_second": stats(system_disk_read),
+            "system_disk_write_bytes_per_second": stats(system_disk_write),
         },
         event_counts=dict(sorted(event_counts.items())),
     )

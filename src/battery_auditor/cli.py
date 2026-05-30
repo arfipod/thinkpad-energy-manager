@@ -129,20 +129,30 @@ def load_runtime_config(args: argparse.Namespace) -> AuditorConfig:
     return cfg
 
 
-def db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase:
-    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
-    db.init_schema(configure_journal=False)
+def read_db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase:
+    if not cfg.resolved_db_path().exists():
+        write_db = write_db_from_cfg(cfg)
+        write_db.close()
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg, read_only=True)
+    db.init_schema()
     return db
 
 
 def status_db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase | None:
     if not cfg.resolved_db_path().exists():
         return None
-    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg, read_only=True)
     try:
-        db.init_schema(configure_journal=False)
+        db.init_schema()
     except Exception:  # noqa: BLE001 - runtime status should survive a damaged DB
+        db.close()
         return None
+    return db
+
+
+def write_db_from_cfg(cfg: AuditorConfig) -> BatteryDatabase:
+    db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+    db.init_schema()
     return db
 
 
@@ -230,7 +240,7 @@ def command_resume(_args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
-    db = db_from_cfg(cfg)
+    db = read_db_from_cfg(cfg)
     rows = db.list_sessions(limit=args.limit)
     if not rows:
         print("No sessions.")
@@ -249,7 +259,7 @@ def command_delete_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     if _active_collector_may_be_writing(cfg):
         print("Refusing to delete sessions while an active collector may be writing.", file=sys.stderr)
         return 2
-    db = db_from_cfg(cfg)
+    db = write_db_from_cfg(cfg)
     if db.delete_session(args.session_id):
         print(f"Deleted session {args.session_id}.")
         return 0
@@ -258,10 +268,10 @@ def command_delete_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_rename_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
-    db = db_from_cfg(cfg)
-    if _session_is_active_collector_session(cfg, db, args.session_id):
-        print("Refusing to rename the active running collector session.", file=sys.stderr)
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to rename sessions while an active collector may be writing.", file=sys.stderr)
         return 2
+    db = write_db_from_cfg(cfg)
     if db.rename_session(args.session_id, args.name):
         print(f"Renamed session {args.session_id}.")
         return 0
@@ -270,10 +280,10 @@ def command_rename_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_note_session(args: argparse.Namespace, cfg: AuditorConfig) -> int:
-    db = db_from_cfg(cfg)
-    if _session_is_active_collector_session(cfg, db, args.session_id):
-        print("Refusing to edit notes on the active running collector session.", file=sys.stderr)
+    if _active_collector_may_be_writing(cfg):
+        print("Refusing to edit notes while an active collector may be writing.", file=sys.stderr)
         return 2
+    db = write_db_from_cfg(cfg)
     if db.update_session_notes(args.session_id, args.notes):
         print(f"Updated notes for session {args.session_id}.")
         return 0
@@ -285,7 +295,7 @@ def command_merge_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     if _active_collector_may_be_writing(cfg):
         print("Refusing to merge sessions while an active collector may be writing.", file=sys.stderr)
         return 2
-    db = db_from_cfg(cfg)
+    db = write_db_from_cfg(cfg)
     open_ids = {str(row["id"]) for row in db.list_open_sessions()}
     selected_open = [session_id for session_id in args.session_ids if session_id in open_ids]
     if selected_open:
@@ -306,7 +316,7 @@ def command_merge_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_analyze(args: argparse.Namespace, cfg: AuditorConfig) -> int:
-    db = db_from_cfg(cfg)
+    db = read_db_from_cfg(cfg)
     session_id = args.session_id or db.latest_session_id()
     if session_id is None:
         print("No sessions found.", file=sys.stderr)
@@ -320,7 +330,7 @@ def command_analyze(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_export(args: argparse.Namespace, cfg: AuditorConfig) -> int:
-    db = db_from_cfg(cfg)
+    db = read_db_from_cfg(cfg)
     session_id = args.session_id or db.latest_session_id()
     if session_id is None:
         print("No sessions found.", file=sys.stderr)
@@ -337,7 +347,7 @@ def command_recover(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     if _active_collector_may_be_writing(cfg):
         print("Refusing to recover open sessions while an active collector may be writing.", file=sys.stderr)
         return 2
-    db = db_from_cfg(cfg)
+    db = write_db_from_cfg(cfg)
     recovered = db.recover_open_sessions(reason=args.reason)
     if recovered:
         print("Recovered sessions:")

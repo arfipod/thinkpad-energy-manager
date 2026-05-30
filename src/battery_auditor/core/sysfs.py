@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from battery_auditor.core.models import BatterySnapshot, PowerSupplySnapshot, SystemSnapshot
@@ -31,6 +32,15 @@ BATTERY_FIELDS = {
 }
 
 SUPPLY_FIELDS = {"type", "online"}
+
+
+@dataclass(slots=True)
+class SystemLoadCounters:
+    monotonic_time: float
+    cpu_total_ticks: int | None
+    cpu_idle_ticks: int | None
+    disk_read_bytes: int | None
+    disk_write_bytes: int | None
 
 
 def read_text_file(path: Path) -> str | None:
@@ -178,3 +188,144 @@ def read_process_metrics() -> tuple[int | None, float | None, float | None]:
         pass
 
     return rss_kib, user_cpu, system_cpu
+
+
+def read_system_load_metrics(previous: SystemLoadCounters | None = None) -> tuple[dict[str, float | int | None], SystemLoadCounters]:
+    now = time.monotonic()
+    cpu_total, cpu_idle = _read_cpu_ticks()
+    read_bytes, write_bytes = _read_disk_bytes()
+    counters = SystemLoadCounters(
+        monotonic_time=now,
+        cpu_total_ticks=cpu_total,
+        cpu_idle_ticks=cpu_idle,
+        disk_read_bytes=read_bytes,
+        disk_write_bytes=write_bytes,
+    )
+    metrics: dict[str, float | int | None] = {
+        "system_cpu_percent": _cpu_percent(previous, counters),
+        "system_load_1m": _read_load_1m(),
+        **_read_memory_metrics(),
+        "system_disk_read_bytes_per_second": _bytes_per_second(
+            previous.disk_read_bytes if previous else None,
+            counters.disk_read_bytes,
+            previous.monotonic_time if previous else None,
+            counters.monotonic_time,
+        ),
+        "system_disk_write_bytes_per_second": _bytes_per_second(
+            previous.disk_write_bytes if previous else None,
+            counters.disk_write_bytes,
+            previous.monotonic_time if previous else None,
+            counters.monotonic_time,
+        ),
+    }
+    return metrics, counters
+
+
+def _read_cpu_ticks() -> tuple[int | None, int | None]:
+    try:
+        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    except (OSError, IndexError):
+        return None, None
+    if not fields or fields[0] != "cpu":
+        return None, None
+    try:
+        values = [int(value) for value in fields[1:]]
+    except ValueError:
+        return None, None
+    if len(values) < 5:
+        return None, None
+    idle = values[3] + values[4]
+    return sum(values), idle
+
+
+def _cpu_percent(previous: SystemLoadCounters | None, current: SystemLoadCounters) -> float | None:
+    if (
+        previous is None
+        or previous.cpu_total_ticks is None
+        or previous.cpu_idle_ticks is None
+        or current.cpu_total_ticks is None
+        or current.cpu_idle_ticks is None
+    ):
+        return None
+    total_delta = current.cpu_total_ticks - previous.cpu_total_ticks
+    idle_delta = current.cpu_idle_ticks - previous.cpu_idle_ticks
+    if total_delta <= 0:
+        return None
+    return max(0.0, min(100.0, ((total_delta - idle_delta) / total_delta) * 100.0))
+
+
+def _read_load_1m() -> float | None:
+    try:
+        return float(Path("/proc/loadavg").read_text(encoding="utf-8").split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _read_memory_metrics() -> dict[str, int | float | None]:
+    values: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, raw_value = line.split(":", 1)
+            value = raw_value.strip().split()[0]
+            values[key] = int(value)
+    except (OSError, IndexError, ValueError):
+        return {
+            "system_memory_total_kib": None,
+            "system_memory_available_kib": None,
+            "system_memory_used_percent": None,
+        }
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable")
+    used_percent = None if not total or available is None else ((total - available) / total) * 100.0
+    return {
+        "system_memory_total_kib": total,
+        "system_memory_available_kib": available,
+        "system_memory_used_percent": used_percent,
+    }
+
+
+def _read_disk_bytes() -> tuple[int | None, int | None]:
+    read_sectors = 0
+    write_sectors = 0
+    found = False
+    try:
+        lines = Path("/proc/diskstats").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 14 or _is_virtual_block_device(fields[2]):
+            continue
+        try:
+            read_sectors += int(fields[5])
+            write_sectors += int(fields[9])
+        except ValueError:
+            continue
+        found = True
+    if not found:
+        return None, None
+    return read_sectors * 512, write_sectors * 512
+
+
+def _is_virtual_block_device(name: str) -> bool:
+    return (
+        name.startswith("loop")
+        or name.startswith("ram")
+        or name.startswith("zram")
+        or name.startswith("dm-")
+        or name.startswith("md")
+    )
+
+
+def _bytes_per_second(
+    previous_value: int | None,
+    current_value: int | None,
+    previous_time: float | None,
+    current_time: float,
+) -> float | None:
+    if previous_value is None or current_value is None or previous_time is None:
+        return None
+    elapsed = current_time - previous_time
+    if elapsed <= 0:
+        return None
+    return max(0.0, (current_value - previous_value) / elapsed)

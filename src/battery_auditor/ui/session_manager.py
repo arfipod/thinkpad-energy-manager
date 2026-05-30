@@ -217,20 +217,25 @@ class SessionManager(QWidget):
         selected = self._exactly_one("Rename")
         if selected is None:
             return
-        if self._refuse_active_session_mutation(selected, "rename"):
+        if self._collector_may_be_writing():
+            QMessageBox.warning(self, "Rename", "Stop the active collector before renaming sessions.")
             return
         session = self.db.get_session(selected)
         current = "" if session is None else str(session["name"] or "")
         name, ok = QInputDialog.getText(self, "Rename session", "Name", text=current)
         if not ok:
             return
+        write_db = self._open_write_db()
         try:
-            if not self.db.rename_session(selected, name):
+            if not write_db.rename_session(selected, name):
                 QMessageBox.warning(self, "Rename", f"Unknown session: {selected}")
                 return
         except sqlite3.DatabaseError as exc:
             QMessageBox.warning(self, "Rename", str(exc))
             return
+        finally:
+            write_db.close()
+        self.db.close()
         self.refresh()
         self.refresh_main()
 
@@ -238,20 +243,25 @@ class SessionManager(QWidget):
         selected = self._exactly_one("Edit notes")
         if selected is None:
             return
-        if self._refuse_active_session_mutation(selected, "edit notes on"):
+        if self._collector_may_be_writing():
+            QMessageBox.warning(self, "Edit notes", "Stop the active collector before editing notes.")
             return
         session = self.db.get_session(selected)
         current = "" if session is None else str(session["notes"] or "")
         notes, ok = QInputDialog.getMultiLineText(self, "Edit notes", "Notes", current)
         if not ok:
             return
+        write_db = self._open_write_db()
         try:
-            if not self.db.update_session_notes(selected, notes):
+            if not write_db.update_session_notes(selected, notes):
                 QMessageBox.warning(self, "Edit notes", f"Unknown session: {selected}")
                 return
         except sqlite3.DatabaseError as exc:
             QMessageBox.warning(self, "Edit notes", str(exc))
             return
+        finally:
+            write_db.close()
+        self.db.close()
         self.refresh()
         self.refresh_main()
 
@@ -270,12 +280,16 @@ class SessionManager(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        write_db = self._open_write_db()
         try:
             for session_id in selected:
-                self.db.delete_session(session_id)
+                write_db.delete_session(session_id)
         except sqlite3.DatabaseError as exc:
             QMessageBox.warning(self, "Delete", str(exc))
             return
+        finally:
+            write_db.close()
+        self.db.close()
         self.refresh()
         self.refresh_main()
 
@@ -306,11 +320,15 @@ class SessionManager(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         merged_id = f"merged-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        write_db = self._open_write_db()
         try:
-            self.db.merge_sessions(selected, merged_id, name)
+            write_db.merge_sessions(selected, merged_id, name)
         except (ValueError, sqlite3.DatabaseError) as exc:
             QMessageBox.warning(self, "Merge", str(exc))
             return
+        finally:
+            write_db.close()
+        self.db.close()
         self.refresh()
         self.refresh_main()
         self.open_in_chart(merged_id)
@@ -326,11 +344,15 @@ class SessionManager(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        write_db = self._open_write_db()
         try:
-            recovered = self.db.recover_open_sessions(reason="ui_recover")
+            recovered = write_db.recover_open_sessions(reason="ui_recover")
         except sqlite3.DatabaseError as exc:
             QMessageBox.warning(self, "Recover", str(exc))
             return
+        finally:
+            write_db.close()
+        self.db.close()
         QMessageBox.information(self, "Recover", f"Recovered {len(recovered)} session(s).")
         self.refresh()
         self.refresh_main()
@@ -367,6 +389,11 @@ class SessionManager(QWidget):
             QMessageBox.warning(self, "Session active", f"Stop the collector before trying to {verb} its active session.")
             return True
         return False
+
+    def _open_write_db(self) -> BatteryDatabase:
+        db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
+        db.init_schema()
+        return db
 
     def _is_open_session(self, session_id: str) -> bool:
         session = self.db.get_session(session_id)

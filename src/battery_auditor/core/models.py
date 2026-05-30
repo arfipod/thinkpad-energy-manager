@@ -98,6 +98,13 @@ class CollectorMetrics:
     collector_user_cpu_seconds: float | None = None
     collector_system_cpu_seconds: float | None = None
     loop_delay_ms: float | None = None
+    system_cpu_percent: float | None = None
+    system_load_1m: float | None = None
+    system_memory_total_kib: int | None = None
+    system_memory_available_kib: int | None = None
+    system_memory_used_percent: float | None = None
+    system_disk_read_bytes_per_second: float | None = None
+    system_disk_write_bytes_per_second: float | None = None
 
 
 @dataclass(slots=True)

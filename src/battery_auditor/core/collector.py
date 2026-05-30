@@ -22,7 +22,12 @@ from battery_auditor.core.runtime import (
     write_heartbeat,
     write_lock_payload,
 )
-from battery_auditor.core.sysfs import read_process_metrics, read_snapshot
+from battery_auditor.core.sysfs import (
+    SystemLoadCounters,
+    read_process_metrics,
+    read_snapshot,
+    read_system_load_metrics,
+)
 
 
 @dataclass(slots=True)
@@ -41,6 +46,7 @@ class BatteryCollector:
         self._lock_file: TextIO | None = None
         self._control_mtime_ns: int | None = None
         self._pause_requested = False
+        self._previous_system_load: SystemLoadCounters | None = None
 
     def request_stop(self, *_args: object) -> None:
         self.stop_requested = True
@@ -182,10 +188,22 @@ class BatteryCollector:
     def _sample(self, loop_delay_ms: float) -> SystemSnapshot:
         snap = read_snapshot(self.cfg.sysfs_power_supply_dir)
         rss, user_cpu, system_cpu = read_process_metrics()
+        system_metrics, self._previous_system_load = read_system_load_metrics(self._previous_system_load)
         snap.metrics.collector_rss_kib = rss
         snap.metrics.collector_user_cpu_seconds = user_cpu
         snap.metrics.collector_system_cpu_seconds = system_cpu
         snap.metrics.loop_delay_ms = loop_delay_ms
+        snap.metrics.system_cpu_percent = _float_or_none(system_metrics["system_cpu_percent"])
+        snap.metrics.system_load_1m = _float_or_none(system_metrics["system_load_1m"])
+        snap.metrics.system_memory_total_kib = _int_or_none(system_metrics["system_memory_total_kib"])
+        snap.metrics.system_memory_available_kib = _int_or_none(system_metrics["system_memory_available_kib"])
+        snap.metrics.system_memory_used_percent = _float_or_none(system_metrics["system_memory_used_percent"])
+        snap.metrics.system_disk_read_bytes_per_second = _float_or_none(
+            system_metrics["system_disk_read_bytes_per_second"]
+        )
+        snap.metrics.system_disk_write_bytes_per_second = _float_or_none(
+            system_metrics["system_disk_write_bytes_per_second"]
+        )
         return snap
 
     def _new_session_id(self) -> str:
@@ -286,3 +304,11 @@ class BatteryCollector:
             lock_file.close()
         with suppress(OSError):
             lock_path(self.cfg).unlink()
+
+
+def _float_or_none(value: float | int | None) -> float | None:
+    return None if value is None else float(value)
+
+
+def _int_or_none(value: float | int | None) -> int | None:
+    return None if value is None else int(value)

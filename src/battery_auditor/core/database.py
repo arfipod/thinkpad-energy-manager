@@ -14,7 +14,7 @@ from typing import Any, cast
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.models import BatterySnapshot, Event, SystemSnapshot
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DATA_TABLES = ("sessions", "samples", "sample_batteries", "power_supplies", "events")
 
@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS samples (
     collector_user_cpu_seconds REAL,
     collector_system_cpu_seconds REAL,
     loop_delay_ms REAL,
+    system_cpu_percent REAL,
+    system_load_1m REAL,
+    system_memory_total_kib INTEGER,
+    system_memory_available_kib INTEGER,
+    system_memory_used_percent REAL,
+    system_disk_read_bytes_per_second REAL,
+    system_disk_write_bytes_per_second REAL,
     created_at_wall REAL NOT NULL,
     UNIQUE(session_id, seq)
 );
@@ -140,20 +147,28 @@ class DatabaseRepairResult:
 
 
 class BatteryDatabase:
-    def __init__(self, db_path: Path, cfg: AuditorConfig | None = None) -> None:
+    def __init__(self, db_path: Path, cfg: AuditorConfig | None = None, *, read_only: bool = False) -> None:
         self.db_path = db_path.expanduser()
         self.cfg = cfg or AuditorConfig(db_path=self.db_path)
         self.conn: sqlite3.Connection | None = None
+        self.read_only = read_only
 
     def connect(self) -> sqlite3.Connection:
         if self.conn is not None:
             return self.conn
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        if self.read_only:
+            uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, timeout=30.0, uri=True)
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(f"PRAGMA synchronous = {self.cfg.sqlite_synchronous}")
-        conn.execute(f"PRAGMA wal_autocheckpoint = {int(self.cfg.sqlite_wal_autocheckpoint_pages)}")
+        if self.read_only:
+            conn.execute("PRAGMA query_only = ON")
+        else:
+            conn.execute(f"PRAGMA synchronous = {self.cfg.sqlite_synchronous}")
+            conn.execute(f"PRAGMA wal_autocheckpoint = {int(self.cfg.sqlite_wal_autocheckpoint_pages)}")
         self.conn = conn
         return conn
 
@@ -163,6 +178,9 @@ class BatteryDatabase:
             self.conn = None
 
     def init_schema(self, *, configure_journal: bool = True) -> None:
+        if self.read_only:
+            self._verify_schema_version()
+            return
         conn = self.connect()
         if configure_journal:
             try:
@@ -170,9 +188,41 @@ class BatteryDatabase:
             except sqlite3.OperationalError as exc:
                 if "database is locked" not in str(exc).lower():
                     raise
+        current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         conn.executescript(SCHEMA_SQL)
+        self._migrate_schema(current_version)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
+
+    def _verify_schema_version(self) -> None:
+        conn = self.connect()
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(f"Unsupported database schema version: {version}")
+
+    def _migrate_schema(self, current_version: int) -> None:
+        if current_version > SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(f"Unsupported database schema version: {current_version}")
+        if current_version < 2:
+            self._add_missing_columns(
+                "samples",
+                {
+                    "system_cpu_percent": "REAL",
+                    "system_load_1m": "REAL",
+                    "system_memory_total_kib": "INTEGER",
+                    "system_memory_available_kib": "INTEGER",
+                    "system_memory_used_percent": "REAL",
+                    "system_disk_read_bytes_per_second": "REAL",
+                    "system_disk_write_bytes_per_second": "REAL",
+                },
+            )
+
+    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+        conn = self.connect()
+        existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, column_type in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
 
     def check_integrity(self, *, quick: bool = True) -> list[str]:
         pragma = "quick_check" if quick else "integrity_check"
@@ -295,8 +345,11 @@ class BatteryDatabase:
               total_power_now_uw, total_computed_percent, total_health_percent,
               active_batteries, sample_duration_ms, db_write_duration_ms,
               collector_rss_kib, collector_user_cpu_seconds, collector_system_cpu_seconds,
-              loop_delay_ms, created_at_wall
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+              loop_delay_ms, system_cpu_percent, system_load_1m, system_memory_total_kib,
+              system_memory_available_kib, system_memory_used_percent,
+              system_disk_read_bytes_per_second, system_disk_write_bytes_per_second,
+              created_at_wall
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -317,6 +370,13 @@ class BatteryDatabase:
                 snap.metrics.collector_user_cpu_seconds,
                 snap.metrics.collector_system_cpu_seconds,
                 snap.metrics.loop_delay_ms,
+                snap.metrics.system_cpu_percent,
+                snap.metrics.system_load_1m,
+                snap.metrics.system_memory_total_kib,
+                snap.metrics.system_memory_available_kib,
+                snap.metrics.system_memory_used_percent,
+                snap.metrics.system_disk_read_bytes_per_second,
+                snap.metrics.system_disk_write_bytes_per_second,
                 time.time(),
             ),
         )
@@ -541,6 +601,9 @@ class BatteryDatabase:
         sql = """
             SELECT s.seq, s.wall_time, s.wall_iso, s.monotonic_time, s.ac_online,
                    s.total_computed_percent, s.total_energy_now_uwh, s.total_power_now_uw,
+                   s.system_cpu_percent, s.system_load_1m, s.system_memory_total_kib,
+                   s.system_memory_available_kib, s.system_memory_used_percent,
+                   s.system_disk_read_bytes_per_second, s.system_disk_write_bytes_per_second,
                    b.name AS battery_name, b.status, b.capacity_percent, b.computed_percent,
                    b.health_percent, b.energy_now_uwh, b.energy_full_uwh, b.energy_full_design_uwh,
                    b.power_now_uw, b.voltage_now_uv, b.charge_control_start_threshold,
@@ -744,6 +807,13 @@ class BatteryDatabase:
             "collector_user_cpu_seconds",
             "collector_system_cpu_seconds",
             "loop_delay_ms",
+            "system_cpu_percent",
+            "system_load_1m",
+            "system_memory_total_kib",
+            "system_memory_available_kib",
+            "system_memory_used_percent",
+            "system_disk_read_bytes_per_second",
+            "system_disk_write_bytes_per_second",
             "created_at_wall",
         ]
         values = [

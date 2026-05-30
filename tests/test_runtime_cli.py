@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from battery_auditor.cli import main as cli_main
 from battery_auditor.config import AuditorConfig
@@ -22,7 +23,7 @@ from battery_auditor.core.runtime import (
 FIXTURE = Path(__file__).parent / "fixtures" / "sysfs_sample"
 
 
-def test_status_with_no_collector(tmp_path: Path, capsys: object) -> None:
+def test_status_with_no_collector(tmp_path: Path, capsys: Any) -> None:
     config_path = _write_config(tmp_path)
 
     rc = cli_main(["--config", str(config_path), "status", "--json"])
@@ -35,7 +36,7 @@ def test_status_with_no_collector(tmp_path: Path, capsys: object) -> None:
     assert payload["open_session_count"] == 0
 
 
-def test_status_with_fake_heartbeat_and_open_session(tmp_path: Path, capsys: object) -> None:
+def test_status_with_fake_heartbeat_and_open_session(tmp_path: Path, capsys: Any) -> None:
     config_path = _write_config(tmp_path)
     cfg = _cfg(tmp_path)
     db = BatteryDatabase(cfg.resolved_db_path(), cfg)
@@ -65,7 +66,7 @@ def test_status_with_fake_heartbeat_and_open_session(tmp_path: Path, capsys: obj
     assert payload["paused"] is True
 
 
-def test_stop_refuses_unrelated_locked_pid(tmp_path: Path, capsys: object) -> None:
+def test_stop_refuses_unrelated_locked_pid(tmp_path: Path, capsys: Any) -> None:
     config_path = _write_config(tmp_path)
     cfg = _cfg(tmp_path)
     cfg.data_dir.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +34,7 @@ try:
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QComboBox,
         QDoubleSpinBox,
         QFileDialog,
@@ -59,6 +63,76 @@ except ImportError as exc:  # pragma: no cover - depends on optional UI extra
     ) from exc
 
 
+class InactivityGuard:
+    def __init__(self, parent: QWidget) -> None:
+        self.parent = parent
+        self._inhibit_process: subprocess.Popen[bytes] | None = None
+        self._screensaver_window_id: str | None = None
+        self._timer = QTimer(parent)
+        self._timer.timeout.connect(self.poke)
+
+    def enable(self) -> None:
+        if self.active:
+            return
+        inhibit = shutil.which("systemd-inhibit")
+        if inhibit is not None:
+            self._inhibit_process = subprocess.Popen(
+                [
+                    inhibit,
+                    "--what=sleep:idle",
+                    "--mode=block",
+                    "--who=Battery Auditor",
+                    "--why=Battery measurement in progress",
+                    "sleep",
+                    "infinity",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        self._screensaver_window_id = str(int(self.parent.winId()))
+        self._run_quiet("xdg-screensaver", "suspend", self._screensaver_window_id)
+        self._timer.start(20_000)
+        self.poke()
+
+    def disable(self) -> None:
+        self._timer.stop()
+        if self._screensaver_window_id is not None:
+            self._run_quiet("xdg-screensaver", "resume", self._screensaver_window_id)
+            self._screensaver_window_id = None
+        if self._inhibit_process is not None:
+            _terminate_process_group(self._inhibit_process)
+            self._inhibit_process = None
+
+    @property
+    def active(self) -> bool:
+        return self._timer.isActive() or (
+            self._inhibit_process is not None and self._inhibit_process.poll() is None
+        )
+
+    def poke(self) -> None:
+        self._run_quiet("xdg-screensaver", "reset")
+        self._run_quiet("xset", "s", "reset")
+
+    @staticmethod
+    def _run_quiet(*args: str) -> None:
+        if shutil.which(args[0]) is None:
+            return
+        try:
+            subprocess.run(
+                list(args),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+
+
 class BatteryChart(QWidget):
     """Interactive chart for recorded battery series."""
 
@@ -66,14 +140,29 @@ class BatteryChart(QWidget):
         super().__init__()
         self.series: list[tuple[str, list[tuple[float, float]]]] = []
         self.y_label = ""
+        self._data_signature: tuple[str, str, tuple[str, ...]] | None = None
         self.setMinimumHeight(320)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        controls = QHBoxLayout()
+        self.zoom_axes_combo = QComboBox()
+        self.zoom_axes_combo.addItems(["Both axes", "X axis", "Y axis"])
+        self.zoom_axes_combo.setToolTip("Choose which axes respond to mouse drag and wheel zoom.")
+        self.zoom_axes_combo.currentIndexChanged.connect(self._apply_zoom_axes)
+        self.fit_full_button = QPushButton("Fit full graph")
+        self.fit_full_button.setToolTip("Reset the view so every plotted point is visible.")
+        self.fit_full_button.clicked.connect(self.fit_full_graph)
+        controls.addWidget(QLabel("Zoom"))
+        controls.addWidget(self.zoom_axes_combo)
+        controls.addWidget(self.fit_full_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
         self.plot = pg.PlotWidget()
         self.plot.setBackground(None)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "minutes from start")
+        self.plot.setMouseEnabled(x=True, y=True)
         self.plot.addLegend(offset=(12, 12))
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
         layout.addWidget(self.plot)
@@ -81,6 +170,9 @@ class BatteryChart(QWidget):
     def set_data(self, title: str, y_label: str, series: list[tuple[str, list[tuple[float, float]]]]) -> None:
         self.y_label = y_label
         self.series = series
+        signature = (title, y_label, tuple(name for name, _points in series))
+        should_fit = signature != self._data_signature
+        self._data_signature = signature
         self.plot.clear()
         self.plot.setTitle(title)
         self.plot.setLabel("left", y_label)
@@ -112,6 +204,34 @@ class BatteryChart(QWidget):
                 symbolPen=color,
                 symbolSize=5,
             )
+        self._apply_zoom_axes()
+        if should_fit:
+            self.fit_full_graph()
+
+    def fit_full_graph(self) -> None:
+        points = [point for _name, series_points in self.series for point in series_points]
+        if not points:
+            self.plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+            self.plot.autoRange()
+            return
+        x_values = [x for x, _y in points]
+        y_values = [y for _x, y in points]
+        self.plot.setRange(
+            xRange=self._expanded_range(min(x_values), max(x_values)),
+            yRange=self._expanded_range(min(y_values), max(y_values)),
+            padding=0.05,
+        )
+
+    def _apply_zoom_axes(self, _index: int | None = None) -> None:
+        mode = self.zoom_axes_combo.currentText()
+        self.plot.setMouseEnabled(x=mode in {"Both axes", "X axis"}, y=mode in {"Both axes", "Y axis"})
+
+    @staticmethod
+    def _expanded_range(minimum: float, maximum: float) -> tuple[float, float]:
+        if minimum != maximum:
+            return (minimum, maximum)
+        padding = max(abs(minimum) * 0.05, 1.0)
+        return (minimum - padding, maximum + padding)
 
     def _mouse_moved(self, pos: Any) -> None:
         if not self.series or not self.plot.sceneBoundingRect().contains(pos):
@@ -148,11 +268,12 @@ class MainWindow(QMainWindow):
     def __init__(self, cfg: AuditorConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.db = BatteryDatabase(cfg.resolved_db_path(), cfg)
+        self._ensure_database_exists()
+        self.db = BatteryDatabase(cfg.resolved_db_path(), cfg, read_only=True)
         self.db_available = True
         self.db_error: str | None = None
         try:
-            self.db.init_schema(configure_journal=False)
+            self.db.init_schema()
             integrity = self.db.check_integrity(quick=True)
             if integrity != ["ok"]:
                 raise sqlite3.DatabaseError("; ".join(integrity))
@@ -163,6 +284,8 @@ class MainWindow(QMainWindow):
         self._chart_last_seq: int | None = None
         self._active_collector_session_id: str | None = None
         self._user_pinned_chart_session = False
+        self.inactivity_guard = InactivityGuard(self)
+        self.load_process: subprocess.Popen[bytes] | None = None
 
         self.setWindowTitle("Battery Auditor")
         self.resize(1080, 760)
@@ -239,6 +362,15 @@ class MainWindow(QMainWindow):
         status_form.addRow("Samples", self.collector_samples_label)
         layout.addLayout(status_form)
 
+        guard_row = QHBoxLayout()
+        self.prevent_idle_checkbox = QCheckBox("Prevent suspend / idle login")
+        self.prevent_idle_checkbox.toggled.connect(self.toggle_inactivity_guard)
+        self.guard_status_label = QLabel("inactive")
+        guard_row.addWidget(self.prevent_idle_checkbox)
+        guard_row.addWidget(self.guard_status_label)
+        guard_row.addStretch(1)
+        layout.addLayout(guard_row)
+
         row = QHBoxLayout()
         self.start_record_button = QPushButton("Start collector")
         self.pause_record_button = QPushButton("Pause collector")
@@ -271,6 +403,46 @@ class MainWindow(QMainWindow):
         service_row.addStretch(1)
         layout.addLayout(service_row)
 
+        load_form = QHBoxLayout()
+        cpu_count = os.cpu_count() or 1
+        self.load_cpu_workers = QSpinBox()
+        self.load_cpu_workers.setRange(0, max(1, cpu_count * 2))
+        self.load_cpu_workers.setValue(max(1, cpu_count // 2))
+        self.load_cpu_duty = QSpinBox()
+        self.load_cpu_duty.setRange(0, 100)
+        self.load_cpu_duty.setValue(50)
+        self.load_cpu_duty.setSuffix(" %")
+        self.load_memory_mib = QSpinBox()
+        self.load_memory_mib.setRange(0, self._max_memory_load_mib())
+        self.load_memory_mib.setValue(min(256, self.load_memory_mib.maximum()))
+        self.load_memory_mib.setSuffix(" MiB")
+        self.load_disk_mib_s = QDoubleSpinBox()
+        self.load_disk_mib_s.setRange(0.0, 256.0)
+        self.load_disk_mib_s.setDecimals(1)
+        self.load_disk_mib_s.setValue(4.0)
+        self.load_disk_mib_s.setSuffix(" MiB/s")
+        self.start_medium_load_button = QPushButton("Start medium load")
+        self.start_high_load_button = QPushButton("Start high load")
+        self.stop_load_button = QPushButton("Stop load")
+        self.load_status_label = QLabel("load stopped")
+        self.start_medium_load_button.clicked.connect(lambda: self.start_activity_load("medium"))
+        self.start_high_load_button.clicked.connect(lambda: self.start_activity_load("high"))
+        self.stop_load_button.clicked.connect(self.stop_activity_load)
+        load_form.addWidget(QLabel("CPU workers"))
+        load_form.addWidget(self.load_cpu_workers)
+        load_form.addWidget(QLabel("CPU duty"))
+        load_form.addWidget(self.load_cpu_duty)
+        load_form.addWidget(QLabel("Memory"))
+        load_form.addWidget(self.load_memory_mib)
+        load_form.addWidget(QLabel("Disk write"))
+        load_form.addWidget(self.load_disk_mib_s)
+        load_form.addWidget(self.start_medium_load_button)
+        load_form.addWidget(self.start_high_load_button)
+        load_form.addWidget(self.stop_load_button)
+        load_form.addWidget(self.load_status_label)
+        load_form.addStretch(1)
+        layout.addLayout(load_form)
+
         self.collector_output = QTextEdit()
         self.collector_output.setReadOnly(True)
         layout.addWidget(self.collector_output)
@@ -299,6 +471,11 @@ class MainWindow(QMainWindow):
             "power_now_w",
             "voltage_now_v",
             "health_percent",
+            "system_cpu_percent",
+            "system_load_1m",
+            "system_memory_used_percent",
+            "system_disk_read_mib_s",
+            "system_disk_write_mib_s",
         ])
         refresh = QPushButton("Update chart")
         export_csv = QPushButton("Export CSV")
@@ -460,6 +637,7 @@ class MainWindow(QMainWindow):
         self.resume_record_button.setEnabled(status.state == STATUS_PAUSED or status.control.paused)
         self.stop_record_button.setEnabled(active)
         self.force_stop_record_button.setEnabled(active)
+        self.refresh_activity_status()
         return status
 
     def refresh_live_snapshot(self) -> None:
@@ -602,8 +780,105 @@ class MainWindow(QMainWindow):
             return None if row["power_now_uw"] is None else float(row["power_now_uw"]) / 1_000_000.0
         if metric == "voltage_now_v":
             return None if row["voltage_now_uv"] is None else float(row["voltage_now_uv"]) / 1_000_000.0
+        if metric == "system_disk_read_mib_s":
+            return (
+                None
+                if row["system_disk_read_bytes_per_second"] is None
+                else float(row["system_disk_read_bytes_per_second"]) / (1024.0 * 1024.0)
+            )
+        if metric == "system_disk_write_mib_s":
+            return (
+                None
+                if row["system_disk_write_bytes_per_second"] is None
+                else float(row["system_disk_write_bytes_per_second"]) / (1024.0 * 1024.0)
+            )
         value = row[metric]
         return None if value is None else float(value)
+
+    def toggle_inactivity_guard(self, enabled: bool) -> None:
+        if enabled:
+            self.inactivity_guard.enable()
+        else:
+            self.inactivity_guard.disable()
+        self.guard_status_label.setText("active" if self.inactivity_guard.active else "inactive")
+
+    def start_activity_load(self, profile: str) -> None:
+        if self.load_process is not None and self.load_process.poll() is None:
+            QMessageBox.information(self, "Activity load", "A synthetic load is already running.")
+            return
+        self._apply_load_profile(profile)
+        args = [
+            sys.executable,
+            "-m",
+            "battery_auditor.core.loadgen",
+            "--cpu-workers",
+            str(self.load_cpu_workers.value()),
+            "--cpu-duty",
+            f"{self.load_cpu_duty.value() / 100.0:.3f}",
+            "--memory-mib",
+            str(self.load_memory_mib.value()),
+            "--disk-mib-s",
+            f"{self.load_disk_mib_s.value():.1f}",
+        ]
+        log_path = self.cfg.data_dir.expanduser() / "activity-load.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("ab") as log:
+                self.load_process = subprocess.Popen(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError as exc:
+            QMessageBox.warning(self, "Activity load", f"Could not start synthetic load:\n{exc}")
+            self.load_process = None
+            return
+        self.collector_output.append(f"Synthetic {profile} load started. Log: {log_path}")
+        self.refresh_activity_status()
+
+    def stop_activity_load(self) -> None:
+        if self.load_process is not None:
+            _terminate_process_group(self.load_process)
+            self.load_process = None
+        self.refresh_activity_status()
+
+    def refresh_activity_status(self) -> None:
+        if not hasattr(self, "load_status_label"):
+            return
+        running = self.load_process is not None and self.load_process.poll() is None
+        self.load_status_label.setText("load running" if running else "load stopped")
+        self.stop_load_button.setEnabled(running)
+        self.start_medium_load_button.setEnabled(not running)
+        self.start_high_load_button.setEnabled(not running)
+        if hasattr(self, "guard_status_label"):
+            self.guard_status_label.setText("active" if self.inactivity_guard.active else "inactive")
+
+    def _apply_load_profile(self, profile: str) -> None:
+        cpu_count = os.cpu_count() or 1
+        if profile == "high":
+            self.load_cpu_workers.setValue(cpu_count)
+            self.load_cpu_duty.setValue(90)
+            self.load_memory_mib.setValue(min(self.load_memory_mib.maximum(), max(512, self._max_memory_load_mib() // 4)))
+            self.load_disk_mib_s.setValue(16.0)
+            return
+        self.load_cpu_workers.setValue(max(1, cpu_count // 2))
+        self.load_cpu_duty.setValue(50)
+        self.load_memory_mib.setValue(min(self.load_memory_mib.maximum(), 256))
+        self.load_disk_mib_s.setValue(4.0)
+
+    @staticmethod
+    def _max_memory_load_mib() -> int:
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemTotal:"):
+                    total_kib = int(line.split()[1])
+                    return max(128, min(8192, total_kib // 2048))
+        except (OSError, ValueError, IndexError):
+            pass
+        return 4096
 
     def start_collector_process(self) -> None:
         if not self.db_available:
@@ -790,6 +1065,11 @@ class MainWindow(QMainWindow):
             return f'<span style="color:#e5e7eb"><b>{escaped}</b></span>'
         return escaped
 
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt override name
+        self.inactivity_guard.disable()
+        self.stop_activity_load()
+        super().closeEvent(event)
+
     @staticmethod
     def _html_escape(text: str) -> str:
         return (
@@ -864,8 +1144,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Repair database", f"Repair failed:\n{exc}")
             return
 
-        self.db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
-        self.db.init_schema(configure_journal=False)
+        self.db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg, read_only=True)
+        self.db.init_schema()
         if hasattr(self, "sessions_manager"):
             self.sessions_manager.db = self.db
         self.db_available = True
@@ -884,9 +1164,9 @@ class MainWindow(QMainWindow):
         return None if status.current_session_id is None else str(status.current_session_id)
 
     def _try_restore_database(self) -> None:
-        replacement = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
+        replacement = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg, read_only=True)
         try:
-            replacement.init_schema(configure_journal=False)
+            replacement.init_schema()
             integrity = replacement.check_integrity(quick=True)
             if integrity != ["ok"]:
                 raise sqlite3.DatabaseError("; ".join(integrity))
@@ -904,6 +1184,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "db_status_label"):
             self.db_status_label.setText("")
 
+    def _ensure_database_exists(self) -> None:
+        db = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg)
+        try:
+            db.init_schema()
+        finally:
+            db.close()
+
     def _set_database_unavailable(self, exc: sqlite3.DatabaseError) -> None:
         self.db_available = False
         self.db_error = str(exc)
@@ -920,6 +1207,25 @@ class MainWindow(QMainWindow):
             f"Path: {self.cfg.resolved_db_path()}\n"
             "Live status can still be refreshed, but recorded sessions are disabled until the database is repaired or moved aside."
         )
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        process.wait(timeout=5.0)
 
 
 def main() -> int:
