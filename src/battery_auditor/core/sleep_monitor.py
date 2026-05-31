@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from battery_auditor.core.models import wall_iso_from_timestamp
 

@@ -7,9 +7,10 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Callable, TextIO
+from typing import TextIO
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.database import BatteryDatabase
@@ -24,19 +25,26 @@ from battery_auditor.core.runtime import (
     write_heartbeat,
     write_lock_payload,
 )
+from battery_auditor.core.sleep_monitor import (
+    RESUME_SAMPLE_TAKEN,
+    RESUMED,
+    SLEEP_MONITOR_UNAVAILABLE,
+    SleepMonitor,
+    SleepMonitorEvent,
+    build_sleep_monitor,
+)
 from battery_auditor.core.sysfs import (
     SystemLoadCounters,
     read_process_metrics,
     read_snapshot,
     read_system_load_metrics,
 )
-from battery_auditor.core.sleep_monitor import (
-    RESUMED,
-    RESUME_SAMPLE_TAKEN,
-    SLEEP_MONITOR_UNAVAILABLE,
-    SleepMonitor,
-    SleepMonitorEvent,
-    build_sleep_monitor,
+from battery_auditor.core.thresholds import (
+    STATUS_MISMATCH,
+    THRESHOLD_MISMATCH,
+    CommandRunner,
+    restore_thresholds,
+    status_for_snapshot,
 )
 
 
@@ -54,6 +62,7 @@ class BatteryCollector:
         db: BatteryDatabase | None = None,
         *,
         sleep_monitor_factory: Callable[[Callable[[SleepMonitorEvent], None]], SleepMonitor] | None = None,
+        threshold_restore_runner: CommandRunner | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db or BatteryDatabase(cfg.resolved_db_path(), cfg)
@@ -67,6 +76,7 @@ class BatteryCollector:
         self._sleep_monitor: SleepMonitor | None = None
         self._sleep_events: queue.Queue[SleepMonitorEvent] = queue.Queue()
         self._wake_event = threading.Event()
+        self._threshold_restore_runner = threshold_restore_runner
 
     def request_stop(self, *_args: object) -> None:
         self.stop_requested = True
@@ -163,6 +173,9 @@ class BatteryCollector:
                     loop_delay_ms = max(0.0, (now_mono - next_deadline) * 1000.0) if seq > 0 else 0.0
                     snap = self._sample(loop_delay_ms=loop_delay_ms)
                     events = self.detector.process(snap)
+                    restore_targets = self._threshold_restore_targets(snap, events, resume_requested=resume_requested)
+                    if restore_targets:
+                        events.extend(self._restore_threshold_events(restore_targets))
                     if resume_requested:
                         events.append(
                             Event(
@@ -250,6 +263,47 @@ class BatteryCollector:
         snap.metrics.wifi_enabled = _bool_or_none(system_metrics["wifi_enabled"])
         snap.metrics.bluetooth_enabled = _bool_or_none(system_metrics["bluetooth_enabled"])
         return snap
+
+    def _threshold_restore_targets(
+        self,
+        snap: SystemSnapshot,
+        events: list[Event],
+        *,
+        resume_requested: bool,
+    ) -> list[str]:
+        targets: set[str] = set()
+        if self.cfg.threshold_restore_on_mismatch:
+            targets.update(
+                event.battery_name
+                for event in events
+                if event.event_type == THRESHOLD_MISMATCH and event.battery_name is not None
+            )
+        if self.cfg.threshold_restore_on_resume and resume_requested:
+            targets.update(self._mismatched_threshold_batteries(snap))
+        return sorted(targets)
+
+    def _mismatched_threshold_batteries(self, snap: SystemSnapshot) -> list[str]:
+        batteries: list[str] = []
+        for battery in snap.batteries:
+            expected = self.cfg.expected_thresholds.get(battery.name)
+            actual_start = battery.charge_control_start_threshold
+            actual_stop = battery.charge_control_end_threshold
+            if actual_start is None:
+                actual_start = battery.charge_start_threshold
+            if actual_stop is None:
+                actual_stop = battery.charge_stop_threshold
+            status = status_for_snapshot(battery.name, expected, actual_start, actual_stop)
+            if status == STATUS_MISMATCH:
+                batteries.append(battery.name)
+        return batteries
+
+    def _restore_threshold_events(self, batteries: list[str]) -> list[Event]:
+        results = restore_thresholds(
+            self.cfg,
+            batteries=batteries,
+            runner=self._threshold_restore_runner,
+        )
+        return [result.to_event() for result in results]
 
     def _start_sleep_monitor(self, session_id: str) -> None:
         if self._sleep_monitor_factory is not None:

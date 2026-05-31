@@ -45,6 +45,12 @@ The collector records these paths if they exist:
 You can define expected thresholds in `config.toml`:
 
 ```toml
+[thresholds]
+restore_on_resume = false
+restore_on_mismatch = false
+restore_command = "tlp"
+require_confirmation = true
+
 [thresholds.BAT0]
 start = 75
 stop = 80
@@ -63,6 +69,18 @@ battery-auditor thresholds status
 ```
 
 TLP configuration, UPower, and sysfs can disagree. Battery Auditor does not treat TLP config as proof that the kernel-visible thresholds are active; it compares the configured target with the sysfs values captured by the collector.
+
+## Optional threshold restore
+
+If sysfs reports a mismatch such as `0/100`, you can ask Battery Auditor to restore the configured values through TLP. This is manual by default:
+
+```bash
+battery-auditor thresholds restore --dry-run
+battery-auditor thresholds restore BAT0 --dry-run
+battery-auditor thresholds restore BAT0 --yes
+```
+
+The command uses `sudo tlp setcharge <start> <stop> BAT*`. Review the dry-run output first. Restoring thresholds can change when the machine charges or stops charging, so automatic restore is disabled unless you set `restore_on_resume = true` or `restore_on_mismatch = true`. If sudo or TLP fails, Battery Auditor records `THRESHOLD_RESTORE_FAILED`; dry runs record `THRESHOLD_RESTORE_DRY_RUN` and never report success.
 
 ## Design note
 

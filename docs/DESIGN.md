@@ -93,9 +93,11 @@ Reports explicitly warn that higher reported health does not mean physical capac
 
 ## Threshold watchdog
 
-The threshold watchdog compares configured charge thresholds with stored sysfs readback for each battery. It uses `charge_control_start_threshold` and `charge_control_end_threshold`, falling back to `charge_start_threshold` and `charge_stop_threshold` when the newer names are unavailable. It never calls TLP, UPower, sudo, or other privileged commands.
+The threshold watchdog compares configured charge thresholds with stored sysfs readback for each battery. It uses `charge_control_start_threshold` and `charge_control_end_threshold`, falling back to `charge_start_threshold` and `charge_stop_threshold` when the newer names are unavailable. Status analysis never calls TLP, UPower, sudo, or other privileged commands.
 
 The model records configured thresholds, current sysfs thresholds, sources, and status values: `OK`, `MISMATCH`, `UNKNOWN`, or `UNSUPPORTED`. A mismatch such as configured `75/80` with sysfs `0/100` emits `THRESHOLD_MISMATCH`; returning to the configured values emits `THRESHOLD_RESTORED`; missing readback emits `THRESHOLD_UNKNOWN`.
+
+Threshold restore is a separate, opt-in action. Manual restore and the optional auto-restore paths emit `THRESHOLD_RESTORE_REQUESTED`, `THRESHOLD_RESTORE_DRY_RUN`, `THRESHOLD_RESTORE_SUCCESS`, `THRESHOLD_RESTORE_FAILED`, or `THRESHOLD_RESTORE_SKIPPED`. The collector only attempts restore when `restore_on_resume` or `restore_on_mismatch` is explicitly enabled.
 
 ## Sleep monitor
 

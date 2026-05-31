@@ -4,7 +4,12 @@ from dataclasses import dataclass, field
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.models import BatterySnapshot, Event, SystemSnapshot
-from battery_auditor.core.thresholds import STATUS_MISMATCH, STATUS_OK, STATUS_UNKNOWN, status_for_snapshot
+from battery_auditor.core.thresholds import (
+    STATUS_MISMATCH,
+    STATUS_OK,
+    STATUS_UNKNOWN,
+    status_for_snapshot,
+)
 
 
 @dataclass(slots=True)

@@ -92,6 +92,8 @@ Run `battery-auditor analyze relearn` after calibration tests. Relearn findings 
 
 If you rely on TLP charge thresholds, check `battery-auditor thresholds status` after resume, recalibration, or unusual charge behavior. The TLP configuration, UPower view, and sysfs readback can disagree. Battery Auditor records sysfs values from the collector and reports mismatches offline, for example configured `75/80` but current sysfs `0/100`. This warns that the kernel-visible thresholds may not be enforcing the preservation window you intended.
 
+Manual threshold restore is available with `battery-auditor thresholds restore --dry-run` and `battery-auditor thresholds restore --yes`. Keep it manual for pure observation. Enabling automatic restore after resume or mismatch can protect the intended charge window, but it also changes system behavior and should be recorded as part of the test conditions.
+
 ### Sleep and resume
 
 With the optional logind sleep monitor enabled, the collector records `ABOUT_TO_SLEEP` and `RESUMED` events and takes an immediate post-resume sample. This helps distinguish a normal suspend from a low-battery shutdown during black-box tests.

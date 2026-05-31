@@ -10,7 +10,7 @@ sudo apt install -y python3 python3-venv python3-pip tlp libxcb-cursor0
 Clone the repository and create the environment:
 
 ```bash
-git clone https://github.com/angelrubiodev/battery-auditor.git
+git clone https://github.com/arfipod/battery-auditor.git
 cd battery-auditor
 python3 -m venv .venv
 source .venv/bin/activate

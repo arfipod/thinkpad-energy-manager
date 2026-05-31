@@ -7,7 +7,11 @@ from typing import Any
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.database import BatteryDatabase
-from battery_auditor.core.gauge_jumps import LOW_END_GAUGE_JUMP, GaugeJumpConfig, analyze_session_jumps
+from battery_auditor.core.gauge_jumps import (
+    LOW_END_GAUGE_JUMP,
+    GaugeJumpConfig,
+    analyze_session_jumps,
+)
 from battery_auditor.core.relearn import ENERGY_FULL_RELEARN, RelearnConfig, analyze_session_relearn
 from battery_auditor.core.thresholds import STATUS_MISMATCH, analyze_session_thresholds
 
@@ -32,7 +36,7 @@ class BatteryModelConfig:
     suspend_gap_seconds: float = 120.0
 
     @classmethod
-    def from_auditor_config(cls, cfg: AuditorConfig) -> "BatteryModelConfig":
+    def from_auditor_config(cls, cfg: AuditorConfig) -> BatteryModelConfig:
         return cls(
             low_end_percent=cfg.model_low_end_percent,
             low_end_margin_fraction=cfg.model_low_end_margin_fraction,

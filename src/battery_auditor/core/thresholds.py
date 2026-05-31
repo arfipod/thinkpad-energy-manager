@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import json
+import shlex
+import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from battery_auditor.config import AuditorConfig, TlpThresholdExpectation
 from battery_auditor.core.database import BatteryDatabase
 from battery_auditor.core.models import Event
+from battery_auditor.core.tlp import CommandResult
 
 THRESHOLD_MISMATCH = "THRESHOLD_MISMATCH"
 THRESHOLD_RESTORED = "THRESHOLD_RESTORED"
 THRESHOLD_UNKNOWN = "THRESHOLD_UNKNOWN"
+THRESHOLD_RESTORE_REQUESTED = "THRESHOLD_RESTORE_REQUESTED"
+THRESHOLD_RESTORE_DRY_RUN = "THRESHOLD_RESTORE_DRY_RUN"
+THRESHOLD_RESTORE_SUCCESS = "THRESHOLD_RESTORE_SUCCESS"
+THRESHOLD_RESTORE_FAILED = "THRESHOLD_RESTORE_FAILED"
+THRESHOLD_RESTORE_SKIPPED = "THRESHOLD_RESTORE_SKIPPED"
 
 SOURCE_CONFIG = "config"
 SOURCE_SYSFS = "sysfs"
@@ -21,6 +31,8 @@ STATUS_OK = "OK"
 STATUS_MISMATCH = "MISMATCH"
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_UNSUPPORTED = "UNSUPPORTED"
+
+CommandRunner = Callable[[list[str]], CommandResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +115,66 @@ class ThresholdEventFinding:
         return f"{self.battery_name}: charge threshold mismatch. configured={configured} sysfs={sysfs}."
 
 
+@dataclass(frozen=True, slots=True)
+class ThresholdRestorePlan:
+    battery_name: str
+    configured_start_threshold: int
+    configured_stop_threshold: int
+    command: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdRestoreResult:
+    event_type: str
+    severity: str
+    battery_name: str
+    configured_start_threshold: int | None
+    configured_stop_threshold: int | None
+    command: list[str]
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    reason: str = ""
+    wall_time: float | None = None
+    monotonic_time: float | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.event_type in {THRESHOLD_RESTORE_SUCCESS, THRESHOLD_RESTORE_DRY_RUN}
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def to_event(self) -> Event:
+        now = self.wall_time if self.wall_time is not None else time.time()
+        mono = self.monotonic_time if self.monotonic_time is not None else time.monotonic()
+        return Event(
+            self.event_type,
+            self.severity,
+            self.message,
+            battery_name=self.battery_name,
+            wall_time=now,
+            monotonic_time=mono,
+            details=self.to_dict(),
+        )
+
+    @property
+    def message(self) -> str:
+        command_text = " ".join(self.command) if self.command else "-"
+        if self.event_type == THRESHOLD_RESTORE_DRY_RUN:
+            return f"{self.battery_name}: threshold restore dry run: {command_text}"
+        if self.event_type == THRESHOLD_RESTORE_SUCCESS:
+            return f"{self.battery_name}: threshold restore succeeded: {command_text}"
+        if self.event_type == THRESHOLD_RESTORE_SKIPPED:
+            return f"{self.battery_name}: threshold restore skipped: {self.reason}"
+        if self.event_type == THRESHOLD_RESTORE_REQUESTED:
+            return f"{self.battery_name}: threshold restore requested: {command_text}"
+        return f"{self.battery_name}: threshold restore failed: {self.reason or self.stderr or command_text}"
+
+
 def analyze_session_thresholds(db: BatteryDatabase, session_id: str, cfg: AuditorConfig) -> list[ThresholdStatus]:
     if db.get_session(session_id) is None:
         raise ValueError(f"Unknown session: {session_id}")
@@ -174,18 +246,124 @@ def persist_threshold_events(db: BatteryDatabase, session_id: str, findings: lis
         db.insert_event(session_id, finding.to_event())
 
 
+def restore_thresholds(
+    cfg: AuditorConfig,
+    *,
+    batteries: list[str] | None = None,
+    dry_run: bool = False,
+    runner: CommandRunner | None = None,
+) -> list[ThresholdRestoreResult]:
+    plans = plan_threshold_restores(cfg, batteries=batteries)
+    if not plans:
+        return [
+            ThresholdRestoreResult(
+                event_type=THRESHOLD_RESTORE_SKIPPED,
+                severity="info",
+                battery_name="",
+                configured_start_threshold=None,
+                configured_stop_threshold=None,
+                command=[],
+                reason="No configured thresholds matched the requested battery selection.",
+            )
+        ]
+    results: list[ThresholdRestoreResult] = []
+    for plan in plans:
+        if dry_run:
+            results.append(_result_from_plan(plan, THRESHOLD_RESTORE_DRY_RUN, "info"))
+            continue
+        results.append(_result_from_plan(plan, THRESHOLD_RESTORE_REQUESTED, "info"))
+        command_runner = runner or default_restore_runner
+        try:
+            completed = command_runner(plan.command)
+        except Exception as exc:  # noqa: BLE001 - restoration should report failure, not crash caller
+            results.append(
+                _result_from_plan(
+                    plan,
+                    THRESHOLD_RESTORE_FAILED,
+                    "warning",
+                    returncode=None,
+                    stderr=str(exc),
+                    reason=type(exc).__name__,
+                )
+            )
+            continue
+        results.append(
+            _result_from_plan(
+                plan,
+                THRESHOLD_RESTORE_SUCCESS if completed.ok else THRESHOLD_RESTORE_FAILED,
+                "info" if completed.ok else "warning",
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                reason="" if completed.ok else completed.stderr or f"Command exited {completed.returncode}",
+            )
+        )
+    return results
+
+
+def plan_threshold_restores(
+    cfg: AuditorConfig,
+    *,
+    batteries: list[str] | None = None,
+) -> list[ThresholdRestorePlan]:
+    selected = set(batteries or sorted(cfg.expected_thresholds))
+    plans: list[ThresholdRestorePlan] = []
+    for battery in sorted(selected):
+        expected = cfg.expected_thresholds.get(battery)
+        if expected is None or expected.start is None or expected.stop is None:
+            continue
+        plans.append(
+            ThresholdRestorePlan(
+                battery_name=battery,
+                configured_start_threshold=expected.start,
+                configured_stop_threshold=expected.stop,
+                command=_restore_command(cfg, battery, expected.start, expected.stop),
+            )
+        )
+    return plans
+
+
+def restore_mismatched_thresholds(
+    cfg: AuditorConfig,
+    statuses: list[ThresholdStatus],
+    *,
+    runner: CommandRunner | None = None,
+    dry_run: bool = False,
+) -> list[ThresholdRestoreResult]:
+    batteries = [status.battery_name for status in statuses if status.status == STATUS_MISMATCH]
+    if not batteries:
+        return [
+            ThresholdRestoreResult(
+                event_type=THRESHOLD_RESTORE_SKIPPED,
+                severity="info",
+                battery_name="",
+                configured_start_threshold=None,
+                configured_stop_threshold=None,
+                command=[],
+                reason="No threshold mismatch detected.",
+            )
+        ]
+    return restore_thresholds(cfg, batteries=batteries, dry_run=dry_run, runner=runner)
+
+
+def persist_restore_results(db: BatteryDatabase, session_id: str, results: list[ThresholdRestoreResult]) -> None:
+    for result in results:
+        db.insert_event(session_id, result.to_event())
+
+
 def samples_from_rows(rows: list[Any]) -> list[ThresholdSample]:
     samples: list[ThresholdSample] = []
     for row in rows:
+        row_keys = set(row.keys())
         start = row["charge_control_start_threshold"]
         stop = row["charge_control_end_threshold"]
         if start is None:
-            start = row["charge_start_threshold"] if "charge_start_threshold" in row.keys() else None
+            start = row["charge_start_threshold"] if "charge_start_threshold" in row_keys else None
         if stop is None:
-            stop = row["charge_stop_threshold"] if "charge_stop_threshold" in row.keys() else None
+            stop = row["charge_stop_threshold"] if "charge_stop_threshold" in row_keys else None
         sample_id = (
             int(row["sample_id"])
-            if "sample_id" in row.keys() and row["sample_id"] is not None
+            if "sample_id" in row_keys and row["sample_id"] is not None
             else None
         )
         samples.append(
@@ -243,6 +421,25 @@ def thresholds_to_json(statuses: list[ThresholdStatus]) -> str:
     return json.dumps([status.to_dict() for status in statuses], ensure_ascii=False, indent=2)
 
 
+def restore_results_to_text(results: list[ThresholdRestoreResult]) -> str:
+    if not results:
+        return "No threshold restore actions."
+    lines: list[str] = []
+    for result in results:
+        command = " ".join(result.command) if result.command else "-"
+        lines.append(
+            f"{result.event_type}: battery={result.battery_name or '-'} command={command} "
+            f"returncode={result.returncode if result.returncode is not None else '-'}"
+        )
+        if result.reason:
+            lines.append(f"  reason: {result.reason}")
+    return "\n".join(lines)
+
+
+def restore_results_to_json(results: list[ThresholdRestoreResult]) -> str:
+    return json.dumps([result.to_dict() for result in results], ensure_ascii=False, indent=2)
+
+
 def status_for_snapshot(
     battery_name: str,
     expected: TlpThresholdExpectation | None,
@@ -256,6 +453,16 @@ def status_for_snapshot(
     if expected.start == sysfs_start_threshold and expected.stop == sysfs_stop_threshold:
         return STATUS_OK
     return STATUS_MISMATCH
+
+
+def default_restore_runner(command: list[str]) -> CommandResult:
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as exc:
+        stdout = _timeout_output_to_text(exc.stdout)
+        stderr = _timeout_output_to_text(exc.stderr) or "Command timed out"
+        return CommandResult(command, 124, stdout, stderr)
+    return CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
 
 
 def _sample_status(sample: ThresholdSample | None, expected: TlpThresholdExpectation | None) -> str:
@@ -318,6 +525,51 @@ def _row_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _restore_command(cfg: AuditorConfig, battery: str, start: int, stop: int) -> list[str]:
+    base = shlex.split(cfg.threshold_restore_command or "tlp")
+    if not base:
+        base = ["tlp"]
+    if base[-1] != "setcharge":
+        base = [*base, "setcharge"]
+    command = [*base, str(start), str(stop), battery]
+    return command if command[0] == "sudo" else ["sudo", *command]
+
+
+def _result_from_plan(
+    plan: ThresholdRestorePlan,
+    event_type: str,
+    severity: str,
+    *,
+    returncode: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    reason: str = "",
+) -> ThresholdRestoreResult:
+    now = time.time()
+    return ThresholdRestoreResult(
+        event_type=event_type,
+        severity=severity,
+        battery_name=plan.battery_name,
+        configured_start_threshold=plan.configured_start_threshold,
+        configured_stop_threshold=plan.configured_stop_threshold,
+        command=plan.command,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        reason=reason,
+        wall_time=now,
+        monotonic_time=time.monotonic(),
+    )
+
+
+def _timeout_output_to_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _format_pair(start: int | None, stop: int | None) -> str:

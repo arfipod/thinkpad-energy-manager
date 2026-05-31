@@ -38,8 +38,8 @@ battery-auditor = "battery_auditor.cli:main"
 battery-auditor-qt = "battery_auditor.ui.main:main"
 
 [project.urls]
-Homepage = "https://github.com/angelrubiodev/battery-auditor"
-Issues = "https://github.com/angelrubiodev/battery-auditor/issues"
+Homepage = "https://github.com/arfipod/battery-auditor"
+Issues = "https://github.com/arfipod/battery-auditor/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

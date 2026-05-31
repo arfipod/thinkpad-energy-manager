@@ -1,6 +1,6 @@
 [Unit]
 Description=Battery Auditor low-impact collector
-Documentation=https://github.com/angelrubiodev/battery-auditor
+Documentation=https://github.com/arfipod/battery-auditor
 After=graphical-session.target
 
 [Service]

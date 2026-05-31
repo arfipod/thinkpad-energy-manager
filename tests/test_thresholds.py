@@ -1,23 +1,39 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from battery_auditor.cli import main as cli_main
 from battery_auditor.config import AuditorConfig, TlpThresholdExpectation, load_config
+from battery_auditor.core.collector import BatteryCollector
 from battery_auditor.core.database import BatteryDatabase
 from battery_auditor.core.models import BatterySnapshot, PowerSupplySnapshot, SystemSnapshot
+from battery_auditor.core.sleep_monitor import (
+    RESUMED,
+    SleepMonitor,
+    SleepMonitorEvent,
+    SleepMonitorUnavailable,
+    make_sleep_monitor_event,
+)
 from battery_auditor.core.thresholds import (
     STATUS_MISMATCH,
     STATUS_OK,
     STATUS_UNKNOWN,
     THRESHOLD_MISMATCH,
+    THRESHOLD_RESTORE_DRY_RUN,
+    THRESHOLD_RESTORE_FAILED,
+    THRESHOLD_RESTORE_SUCCESS,
     THRESHOLD_RESTORED,
     analyze_session_thresholds,
+    restore_thresholds,
     samples_from_rows,
     threshold_event_findings,
 )
+from battery_auditor.core.tlp import CommandResult
+
+FIXTURE = Path(__file__).parent / "fixtures" / "sysfs_sample"
 
 
 def test_configured_75_80_and_sysfs_75_80_is_ok(tmp_path: Path) -> None:
@@ -159,6 +175,137 @@ def test_thresholds_config_section_is_supported(tmp_path: Path) -> None:
     assert cfg.expected_thresholds["BAT0"].stop == 80
 
 
+def test_threshold_restore_dry_run_returns_planned_commands_without_success(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+
+    results = restore_thresholds(cfg, dry_run=True)
+
+    assert {result.event_type for result in results} == {THRESHOLD_RESTORE_DRY_RUN}
+    assert THRESHOLD_RESTORE_SUCCESS not in {result.event_type for result in results}
+    assert ["sudo", "tlp", "setcharge", "75", "80", "BAT0"] in [result.command for result in results]
+    assert ["sudo", "tlp", "setcharge", "70", "85", "BAT1"] in [result.command for result in results]
+
+
+def test_threshold_restore_command_uses_configured_bat0_values(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    calls: list[list[str]] = []
+
+    results = restore_thresholds(cfg, batteries=["BAT0"], runner=_recording_runner(calls))
+
+    assert calls == [["sudo", "tlp", "setcharge", "75", "80", "BAT0"]]
+    assert results[-1].event_type == THRESHOLD_RESTORE_SUCCESS
+
+
+def test_threshold_restore_command_uses_configured_bat1_values(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    calls: list[list[str]] = []
+
+    results = restore_thresholds(cfg, batteries=["BAT1"], runner=_recording_runner(calls))
+
+    assert calls == [["sudo", "tlp", "setcharge", "70", "85", "BAT1"]]
+    assert results[-1].event_type == THRESHOLD_RESTORE_SUCCESS
+
+
+def test_threshold_restore_failure_produces_failed_event(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+
+    results = restore_thresholds(
+        cfg,
+        batteries=["BAT0"],
+        runner=lambda command: CommandResult(command, 1, "", "sudo refused"),
+    )
+
+    assert results[-1].event_type == THRESHOLD_RESTORE_FAILED
+    assert results[-1].reason == "sudo refused"
+
+
+def test_threshold_cli_restore_dry_run_requires_no_command_execution(tmp_path: Path, capsys: Any) -> None:
+    cfg = _restore_cfg(tmp_path)
+    config_path = _write_config(tmp_path, cfg)
+
+    rc = cli_main(["--config", str(config_path), "thresholds", "restore", "BAT0", "--dry-run"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "THRESHOLD_RESTORE_DRY_RUN" in output
+    assert "sudo tlp setcharge 75 80 BAT0" in output
+    assert THRESHOLD_RESTORE_SUCCESS not in output
+
+
+def test_threshold_mismatch_auto_restore_requires_opt_in(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    cfg.sysfs_power_supply_dir = FIXTURE
+    cfg.threshold_restore_on_mismatch = False
+    calls: list[list[str]] = []
+
+    BatteryCollector(cfg, threshold_restore_runner=_recording_runner(calls)).run(
+        name="no-auto-restore",
+        interval_seconds=0.01,
+        duration_seconds=0.02,
+        recover_open_sessions=False,
+    )
+
+    assert calls == []
+
+
+def test_threshold_mismatch_auto_restore_runs_when_enabled(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    cfg.sysfs_power_supply_dir = FIXTURE
+    cfg.threshold_restore_on_mismatch = True
+    calls: list[list[str]] = []
+
+    BatteryCollector(cfg, threshold_restore_runner=_recording_runner(calls)).run(
+        name="auto-restore",
+        interval_seconds=0.01,
+        duration_seconds=0.02,
+        recover_open_sessions=False,
+    )
+
+    assert ["sudo", "tlp", "setcharge", "75", "80", "BAT0"] in calls
+    assert ["sudo", "tlp", "setcharge", "70", "85", "BAT1"] in calls
+
+
+def test_resume_auto_restore_requires_opt_in(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    cfg.sysfs_power_supply_dir = FIXTURE
+    cfg.threshold_restore_on_resume = False
+    calls: list[list[str]] = []
+
+    BatteryCollector(
+        cfg,
+        sleep_monitor_factory=_resume_monitor,
+        threshold_restore_runner=_recording_runner(calls),
+    ).run(
+        name="resume-no-auto-restore",
+        interval_seconds=10.0,
+        duration_seconds=0.03,
+        recover_open_sessions=False,
+    )
+
+    assert calls == []
+
+
+def test_resume_auto_restore_runs_when_enabled(tmp_path: Path) -> None:
+    cfg = _restore_cfg(tmp_path)
+    cfg.sysfs_power_supply_dir = FIXTURE
+    cfg.threshold_restore_on_resume = True
+    calls: list[list[str]] = []
+
+    BatteryCollector(
+        cfg,
+        sleep_monitor_factory=_resume_monitor,
+        threshold_restore_runner=_recording_runner(calls),
+    ).run(
+        name="resume-auto-restore",
+        interval_seconds=10.0,
+        duration_seconds=0.03,
+        recover_open_sessions=False,
+    )
+
+    assert ["sudo", "tlp", "setcharge", "75", "80", "BAT0"] in calls
+    assert ["sudo", "tlp", "setcharge", "70", "85", "BAT1"] in calls
+
+
 def _write_threshold_session(
     tmp_path: Path,
     rows: list[dict[str, Any]],
@@ -173,6 +320,37 @@ def _write_threshold_session(
         db.insert_snapshot("threshold-session", int(row["seq"]), _snapshot(**row), [])
     db.end_session("threshold-session")
     return db, cfg
+
+
+def _restore_cfg(tmp_path: Path) -> AuditorConfig:
+    cfg = AuditorConfig(data_dir=tmp_path, db_path=tmp_path / "test.sqlite3")
+    cfg.expected_thresholds["BAT0"] = TlpThresholdExpectation(start=75, stop=80)
+    cfg.expected_thresholds["BAT1"] = TlpThresholdExpectation(start=70, stop=85)
+    return cfg
+
+
+def _recording_runner(calls: list[list[str]]) -> Callable[[list[str]], CommandResult]:
+    def runner(command: list[str]) -> CommandResult:
+        calls.append(command)
+        return CommandResult(command, 0, "ok", "")
+
+    return runner
+
+
+def _resume_monitor(callback: Callable[[SleepMonitorEvent], None]) -> SleepMonitor:
+    return _ResumeMonitor(callback)
+
+
+class _ResumeMonitor(SleepMonitor):
+    def __init__(self, callback: Callable[[SleepMonitorEvent], None]) -> None:
+        self.callback = callback
+
+    def start(self) -> SleepMonitorUnavailable | None:
+        self.callback(make_sleep_monitor_event(RESUMED))
+        return None
+
+    def stop(self) -> None:
+        return None
 
 
 def _snapshot_row(seq: int, batteries: list[tuple[str, int | None, int | None]]) -> dict[str, Any]:

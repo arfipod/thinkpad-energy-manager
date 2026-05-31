@@ -27,7 +27,7 @@ _TRANSITION_EVENTS = {
 
 
 class GapClassifier(Protocol):
-    def __call__(self, previous: "GaugeSample", current: "GaugeSample") -> str | None:
+    def __call__(self, previous: GaugeSample, current: GaugeSample) -> str | None:
         """Return a gap classification such as SUSPEND, or None for normal samples."""
 
 
@@ -41,7 +41,7 @@ class GaugeJumpConfig:
     suspend_gap_seconds: float | None = None
 
     @classmethod
-    def from_auditor_config(cls, cfg: AuditorConfig) -> "GaugeJumpConfig":
+    def from_auditor_config(cls, cfg: AuditorConfig) -> GaugeJumpConfig:
         return cls(
             absolute_tolerance_wh=cfg.gauge_jump_absolute_tolerance_wh,
             relative_tolerance=cfg.gauge_jump_relative_tolerance,
@@ -177,12 +177,13 @@ def persist_gauge_jump_events(db: BatteryDatabase, session_id: str, findings: li
 def samples_from_rows(rows: list[Any]) -> list[GaugeSample]:
     builders: dict[int, dict[str, Any]] = {}
     for row in rows:
+        row_keys = set(row.keys())
         seq = int(row["seq"])
         sample = builders.get(seq)
         if sample is None:
             sample_id = (
                 int(row["sample_id"])
-                if "sample_id" in row.keys() and row["sample_id"] is not None
+                if "sample_id" in row_keys and row["sample_id"] is not None
                 else None
             )
             sample = {

@@ -31,7 +31,7 @@ class RelearnConfig:
     full_charge_percent: float = 98.0
 
     @classmethod
-    def from_auditor_config(cls, cfg: AuditorConfig) -> "RelearnConfig":
+    def from_auditor_config(cls, cfg: AuditorConfig) -> RelearnConfig:
         return cls(
             min_absolute_change_wh=cfg.relearn_min_absolute_change_wh,
             min_relative_change_percent=cfg.relearn_min_relative_change_percent,
@@ -167,12 +167,13 @@ def persist_relearn_events(db: BatteryDatabase, session_id: str, findings: list[
 def samples_from_rows(rows: list[Any]) -> list[RelearnSample]:
     builders: dict[int, dict[str, Any]] = {}
     for row in rows:
+        row_keys = set(row.keys())
         seq = int(row["seq"])
         sample = builders.get(seq)
         if sample is None:
             sample_id = (
                 int(row["sample_id"])
-                if "sample_id" in row.keys() and row["sample_id"] is not None
+                if "sample_id" in row_keys and row["sample_id"] is not None
                 else None
             )
             sample = {

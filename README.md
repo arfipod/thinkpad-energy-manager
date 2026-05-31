@@ -143,6 +143,8 @@ Show configured vs sysfs charge threshold readback:
 ```bash
 battery-auditor thresholds status
 battery-auditor thresholds status <session_id>
+battery-auditor thresholds restore --dry-run
+battery-auditor thresholds restore BAT0 --yes
 ```
 
 Estimate effective charge state and runtime:
@@ -358,7 +360,9 @@ TLP actions are manual and are not part of the periodic collector, so they do no
 
 Charge thresholds can be configured in TLP while the live sysfs readback reports something else. On some systems the expected 75/80 thresholds can temporarily appear as 0/100 after firmware, resume, or power-management events. That matters because the battery may charge outside the intended preservation window even though the user-space configuration still looks correct.
 
-`battery-auditor thresholds status` compares configured thresholds with the latest stored sysfs readback from `charge_control_start_threshold` / `charge_control_end_threshold`, falling back to `charge_start_threshold` / `charge_stop_threshold` when needed. It does not run privileged commands and does not auto-restore thresholds. TLP config, UPower, and sysfs can disagree because they observe or manage different layers; the watchdog treats sysfs as the current kernel readback and reports `OK`, `MISMATCH`, or `UNKNOWN`.
+`battery-auditor thresholds status` compares configured thresholds with the latest stored sysfs readback from `charge_control_start_threshold` / `charge_control_end_threshold`, falling back to `charge_start_threshold` / `charge_stop_threshold` when needed. It does not run privileged commands. TLP config, UPower, and sysfs can disagree because they observe or manage different layers; the watchdog treats sysfs as the current kernel readback and reports `OK`, `MISMATCH`, or `UNKNOWN`.
+
+Restoring thresholds is optional and explicit because it changes charging behavior. Use `battery-auditor thresholds restore --dry-run` to review the exact `sudo tlp setcharge <start> <stop> BAT*` commands. Run `battery-auditor thresholds restore --yes` or target one battery such as `battery-auditor thresholds restore BAT1 --yes` only after confirming the configured values. Automatic restore after resume or mismatch is disabled by default and must be enabled in config.
 
 ## Recorded data
 
@@ -389,6 +393,12 @@ Pay special attention to:
 ```toml
 [sampling]
 interval_seconds = 2.0
+
+[thresholds]
+restore_on_resume = false
+restore_on_mismatch = false
+restore_command = "tlp"
+require_confirmation = true
 
 [thresholds.BAT0]
 start = 75

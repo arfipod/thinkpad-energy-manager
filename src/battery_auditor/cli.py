@@ -51,11 +51,17 @@ from battery_auditor.core.runtime import (
 from battery_auditor.core.sysfs import read_snapshot
 from battery_auditor.core.thresholds import (
     analyze_session_thresholds,
+    persist_restore_results,
     persist_threshold_events,
-    samples_from_rows as threshold_samples_from_rows,
+    restore_results_to_json,
+    restore_results_to_text,
+    restore_thresholds,
     threshold_event_findings,
     thresholds_to_json,
     thresholds_to_text,
+)
+from battery_auditor.core.thresholds import (
+    samples_from_rows as threshold_samples_from_rows,
 )
 from battery_auditor.core.tlp import TlpClient
 
@@ -138,10 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--out", type=Path, help="Write the repaired database to this path.")
     repair.add_argument("--replace", action="store_true", help="Back up and replace the configured database.")
 
-    thresholds = sub.add_parser("thresholds", help="Inspect configured vs sysfs charge thresholds.")
-    thresholds.add_argument("threshold_command", choices=["status"], help="Threshold watchdog action.")
-    thresholds.add_argument("session_id", nargs="?", help="Defaults to latest session.")
+    thresholds = sub.add_parser("thresholds", help="Inspect or restore configured charge thresholds.")
+    thresholds.add_argument("threshold_command", choices=["status", "restore"], help="Threshold watchdog action.")
+    thresholds.add_argument("target", nargs="?", help="Status: session id. Restore: optional BAT0/BAT1 target.")
     thresholds.add_argument("--json", action="store_true")
+    thresholds.add_argument("--dry-run", action="store_true", help="Show restore commands without running them.")
+    thresholds.add_argument("--yes", action="store_true", help="Confirm threshold restore without prompting.")
     thresholds.add_argument("--persist-events", action="store_true", help="Store threshold watchdog events in the events table.")
 
     estimate = sub.add_parser("estimate", help="Estimate effective charge state and runtime.")
@@ -487,8 +495,41 @@ def command_repair_db(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 
 
 def command_thresholds(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    if args.threshold_command == "restore":
+        target = args.target
+        if target is not None and not _valid_battery_target(target):
+            print("Restore target must look like BAT0, BAT1, ...", file=sys.stderr)
+            return 2
+        batteries = [target] if target is not None else None
+        if not args.dry_run and cfg.threshold_restore_require_confirmation and not args.yes:
+            planned = restore_thresholds(cfg, batteries=batteries, dry_run=True)
+            if args.json:
+                print(restore_results_to_json(planned))
+            else:
+                print(restore_results_to_text(planned))
+            print(
+                "Refusing to restore thresholds without explicit confirmation. "
+                "Re-run with --yes, or set thresholds.require_confirmation=false.",
+                file=sys.stderr,
+            )
+            return 2
+        results = restore_thresholds(cfg, batteries=batteries, dry_run=args.dry_run)
+        if args.persist_events:
+            if _active_collector_may_be_writing(cfg):
+                print("Refusing to persist restore events while an active collector may be writing.", file=sys.stderr)
+                return 2
+            write_db = write_db_from_cfg(cfg)
+            session_id = write_db.latest_session_id()
+            if session_id is not None:
+                persist_restore_results(write_db, session_id, results)
+        if args.json:
+            print(restore_results_to_json(results))
+        else:
+            print(restore_results_to_text(results))
+        return 1 if any(not result.ok and result.event_type != "THRESHOLD_RESTORE_REQUESTED" for result in results) else 0
+
     db = read_db_from_cfg(cfg)
-    session_id = args.session_id or db.latest_session_id()
+    session_id = args.target or db.latest_session_id()
     if session_id is None:
         print("No sessions found.", file=sys.stderr)
         return 2
@@ -510,6 +551,10 @@ def command_thresholds(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     else:
         print(thresholds_to_text(statuses))
     return 0
+
+
+def _valid_battery_target(value: str) -> bool:
+    return value.startswith("BAT") and value[3:].isdigit()
 
 
 def command_estimate(args: argparse.Namespace, cfg: AuditorConfig) -> int:

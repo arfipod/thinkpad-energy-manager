@@ -9,8 +9,8 @@ from battery_auditor.config import AuditorConfig
 from battery_auditor.core.collector import BatteryCollector
 from battery_auditor.core.sleep_monitor import (
     ABOUT_TO_SLEEP,
-    RESUMED,
     RESUME_SAMPLE_TAKEN,
+    RESUMED,
     SLEEP_MONITOR_UNAVAILABLE,
     LogindSleepMonitor,
     SleepMonitor,

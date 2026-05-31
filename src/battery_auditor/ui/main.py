@@ -24,7 +24,11 @@ from battery_auditor.core.runtime import (
     collect_runtime_status,
 )
 from battery_auditor.core.sysfs import read_snapshot
-from battery_auditor.core.thresholds import STATUS_MISMATCH, analyze_session_thresholds
+from battery_auditor.core.thresholds import (
+    STATUS_MISMATCH,
+    analyze_session_thresholds,
+    plan_threshold_restores,
+)
 from battery_auditor.core.tlp import TlpClient
 from battery_auditor.ui.session_manager import SessionManager
 
@@ -661,10 +665,13 @@ class MainWindow(QMainWindow):
 
         threshold_row = QHBoxLayout()
         threshold_refresh = QPushButton("Refresh threshold status")
+        threshold_restore = QPushButton("Restore thresholds")
         threshold_refresh.clicked.connect(self.refresh_thresholds)
+        threshold_restore.clicked.connect(self.show_threshold_restore_commands)
         threshold_row.addWidget(QLabel("Configured vs current sysfs thresholds"))
         threshold_row.addStretch(1)
         threshold_row.addWidget(threshold_refresh)
+        threshold_row.addWidget(threshold_restore)
         layout.addLayout(threshold_row)
 
         self.thresholds_table = QTableWidget(0, 6)
@@ -1357,6 +1364,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "TLP", str(exc))
             return
         self.tlp_output.setPlainText(result.combined_output())
+
+    def show_threshold_restore_commands(self) -> None:
+        plans = plan_threshold_restores(self.cfg)
+        if not plans:
+            self.tlp_output.setPlainText("No configured thresholds are available to restore.")
+            return
+        commands = "\n".join(" ".join(plan.command) for plan in plans)
+        self.tlp_output.setPlainText(
+            "Threshold restore is intentionally manual from the UI so a sudo prompt cannot block the app.\n\n"
+            "Commands that would be run:\n"
+            f"{commands}\n\n"
+            "Run this from a terminal after reviewing the commands:\n"
+            "battery-auditor thresholds restore --dry-run\n"
+            "battery-auditor thresholds restore --yes"
+        )
 
     def recalibrate_battery(self) -> None:
         battery = self.tlp_battery.currentText()

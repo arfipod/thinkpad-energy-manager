@@ -80,6 +80,10 @@ class AuditorConfig:
     model_min_eta_pairs: int = 2
     model_ac_transition_exclusion_seconds: float = 5.0
     model_suspend_gap_seconds: float = 120.0
+    threshold_restore_on_resume: bool = False
+    threshold_restore_on_mismatch: bool = False
+    threshold_restore_command: str = "tlp"
+    threshold_restore_require_confirmation: bool = True
 
     expected_thresholds: dict[str, TlpThresholdExpectation] = field(default_factory=dict)
 
@@ -195,8 +199,20 @@ def apply_config_dict(cfg: AuditorConfig, data: dict[str, Any]) -> None:
     if "blackbox_flush_each_sample" in sqlite:
         cfg.blackbox_flush_each_sample = bool(sqlite["blackbox_flush_each_sample"])
 
-    expected = data.get("thresholds", data.get("expected_thresholds", {}))
+    thresholds = data.get("thresholds", {})
+    if "restore_on_resume" in thresholds:
+        cfg.threshold_restore_on_resume = bool(thresholds["restore_on_resume"])
+    if "restore_on_mismatch" in thresholds:
+        cfg.threshold_restore_on_mismatch = bool(thresholds["restore_on_mismatch"])
+    if "restore_command" in thresholds:
+        cfg.threshold_restore_command = str(thresholds["restore_command"])
+    if "require_confirmation" in thresholds:
+        cfg.threshold_restore_require_confirmation = bool(thresholds["require_confirmation"])
+
+    expected = thresholds if thresholds else data.get("expected_thresholds", {})
     for battery, values in expected.items():
+        if not isinstance(values, dict):
+            continue
         cfg.expected_thresholds[str(battery)] = TlpThresholdExpectation(
             start=int(values["start"]) if values.get("start") is not None else None,
             stop=int(values["stop"]) if values.get("stop") is not None else None,

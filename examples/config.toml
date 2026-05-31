@@ -49,6 +49,12 @@ synchronous = "NORMAL"
 wal_autocheckpoint_pages = 200
 blackbox_flush_each_sample = false
 
+[thresholds]
+restore_on_resume = false
+restore_on_mismatch = false
+restore_command = "tlp"
+require_confirmation = true
+
 [thresholds.BAT0]
 start = 75
 stop = 80

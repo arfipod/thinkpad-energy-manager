@@ -150,7 +150,7 @@ def _battery(name: str, status: str, energy_wh: float, power_w: float) -> Batter
         capacity_percent=(energy_wh / energy_full_wh) * 100.0,
         energy_now_uwh=int(energy_wh * 1_000_000),
         energy_full_uwh=int(energy_full_wh * 1_000_000),
-        energy_full_design_uwh=int(30_000_000),
+        energy_full_design_uwh=30_000_000,
         power_now_uw=int(power_w * 1_000_000),
         voltage_now_uv=11_000_000,
     )

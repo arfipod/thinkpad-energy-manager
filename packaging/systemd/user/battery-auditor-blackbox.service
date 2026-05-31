@@ -1,6 +1,6 @@
 [Unit]
 Description=Battery Auditor black-box collector
-Documentation=https://github.com/angelrubiodev/battery-auditor
+Documentation=https://github.com/arfipod/battery-auditor
 After=graphical-session.target
 
 [Service]
