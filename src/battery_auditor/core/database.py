@@ -622,7 +622,7 @@ class BatteryDatabase:
     ) -> list[sqlite3.Row]:
         conn = self.connect()
         sql = """
-            SELECT s.seq, s.wall_time, s.wall_iso, s.monotonic_time, s.ac_online,
+            SELECT s.id AS sample_id, s.seq, s.wall_time, s.wall_iso, s.monotonic_time, s.ac_online,
                    s.total_computed_percent, s.total_energy_now_uwh, s.total_power_now_uw,
                    s.system_cpu_percent, s.system_load_1m, s.system_memory_total_kib,
                    s.system_memory_available_kib, s.system_memory_used_percent,
@@ -632,7 +632,7 @@ class BatteryDatabase:
                    b.name AS battery_name, b.status, b.capacity_percent, b.computed_percent,
                    b.health_percent, b.energy_now_uwh, b.energy_full_uwh, b.energy_full_design_uwh,
                    b.power_now_uw, b.voltage_now_uv, b.charge_control_start_threshold,
-                   b.charge_control_end_threshold
+                   b.charge_control_end_threshold, b.charge_start_threshold, b.charge_stop_threshold
               FROM samples s
               JOIN sample_batteries b ON b.sample_id = s.id
              WHERE s.session_id = ?

@@ -15,13 +15,30 @@ from battery_auditor.core.analyzer import (
     summarize_session,
     summary_to_text,
 )
+from battery_auditor.core.battery_model import estimate_session, estimate_to_json, estimate_to_text
 from battery_auditor.core.collector import BatteryCollector
 from battery_auditor.core.database import BatteryDatabase, repair_database
+from battery_auditor.core.gauge_jumps import (
+    GaugeJumpConfig,
+    analyze_session_jumps,
+    export_jumps_csv,
+    export_jumps_json,
+    jumps_to_text,
+    persist_gauge_jump_events,
+)
 from battery_auditor.core.phase_analyzer import (
     analyze_session_phases,
     export_phases_csv,
     export_phases_json,
     phases_to_text,
+)
+from battery_auditor.core.relearn import (
+    RelearnConfig,
+    analyze_session_relearn,
+    export_relearn_csv,
+    export_relearn_json,
+    persist_relearn_events,
+    relearn_to_text,
 )
 from battery_auditor.core.runtime import (
     STATUS_PAUSED,
@@ -32,6 +49,14 @@ from battery_auditor.core.runtime import (
     write_control_state,
 )
 from battery_auditor.core.sysfs import read_snapshot
+from battery_auditor.core.thresholds import (
+    analyze_session_thresholds,
+    persist_threshold_events,
+    samples_from_rows as threshold_samples_from_rows,
+    threshold_event_findings,
+    thresholds_to_json,
+    thresholds_to_text,
+)
 from battery_auditor.core.tlp import TlpClient
 
 
@@ -91,12 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
     merge_sessions.add_argument("--id", dest="merged_session_id", help="Optional merged session id.")
 
     analyze = sub.add_parser("analyze", help="Analyze a session.")
-    analyze.add_argument("session_id", nargs="?", help="Defaults to latest session. Use 'phases' for phase analysis.")
+    analyze.add_argument("session_id", nargs="?", help="Defaults to latest session. Use 'phases', 'jumps', or 'relearn' for focused analysis.")
     analyze.add_argument("phase_session_id", nargs="?", help=argparse.SUPPRESS)
     analyze.add_argument("--json", action="store_true")
     analyze.add_argument("--phases", action="store_true", help="Show charge/discharge phases instead of the legacy summary.")
-    analyze.add_argument("--format", choices=["csv", "json"], default="csv", help="Export format for --phases --out.")
-    analyze.add_argument("--out", type=Path, help="Optional phase export path.")
+    analyze.add_argument("--jumps", action="store_true", help="Show impossible or suspicious fuel-gauge jumps.")
+    analyze.add_argument("--relearn", action="store_true", help="Show reported full-capacity relearning.")
+    analyze.add_argument("--format", choices=["csv", "json"], default="csv", help="Export format for focused analyzers with --out.")
+    analyze.add_argument("--out", type=Path, help="Optional analyzer export path.")
+    analyze.add_argument("--persist-events", action="store_true", help="Store analyzer findings in the events table.")
 
     export = sub.add_parser("export", help="Export session samples.")
     export.add_argument("session_id", nargs="?", help="Defaults to latest session.")
@@ -109,6 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
     repair = sub.add_parser("repair-db", help="Rebuild a readable SQLite database from a damaged one.")
     repair.add_argument("--out", type=Path, help="Write the repaired database to this path.")
     repair.add_argument("--replace", action="store_true", help="Back up and replace the configured database.")
+
+    thresholds = sub.add_parser("thresholds", help="Inspect configured vs sysfs charge thresholds.")
+    thresholds.add_argument("threshold_command", choices=["status"], help="Threshold watchdog action.")
+    thresholds.add_argument("session_id", nargs="?", help="Defaults to latest session.")
+    thresholds.add_argument("--json", action="store_true")
+    thresholds.add_argument("--persist-events", action="store_true", help="Store threshold watchdog events in the events table.")
+
+    estimate = sub.add_parser("estimate", help="Estimate effective charge state and runtime.")
+    estimate.add_argument("--session", dest="session_id", help="Defaults to latest session.")
+    estimate.add_argument("--json", action="store_true")
 
     tlp_b = sub.add_parser("tlp-stat", help="Run tlp-stat on demand.")
     tlp_b.add_argument("section", choices=["battery", "config", "system"], default="battery", nargs="?")
@@ -328,10 +366,15 @@ def command_merge_sessions(args: argparse.Namespace, cfg: AuditorConfig) -> int:
 def command_analyze(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     db = read_db_from_cfg(cfg)
     phase_mode = bool(args.phases) or args.session_id == "phases"
-    session_id = args.phase_session_id if args.session_id == "phases" else args.session_id
+    jump_mode = bool(args.jumps) or args.session_id == "jumps"
+    relearn_mode = bool(args.relearn) or args.session_id == "relearn"
+    session_id = args.phase_session_id if args.session_id in {"phases", "jumps", "relearn"} else args.session_id
     session_id = session_id or db.latest_session_id()
     if session_id is None:
         print("No sessions found.", file=sys.stderr)
+        return 2
+    if sum(bool(mode) for mode in (phase_mode, jump_mode, relearn_mode)) > 1:
+        print("Choose only one focused analyzer at a time.", file=sys.stderr)
         return 2
     if phase_mode:
         phases = analyze_session_phases(db, session_id)
@@ -345,6 +388,48 @@ def command_analyze(args: argparse.Namespace, cfg: AuditorConfig) -> int:
             print(json.dumps([phase.to_dict() for phase in phases], ensure_ascii=False, indent=2))
         else:
             print(phases_to_text(phases))
+        return 0
+    if jump_mode:
+        config = GaugeJumpConfig.from_auditor_config(cfg)
+        findings = analyze_session_jumps(db, session_id, config=config)
+        if args.persist_events:
+            if _active_collector_may_be_writing(cfg):
+                print("Refusing to persist analyzer events while an active collector may be writing.", file=sys.stderr)
+                return 2
+            db.close()
+            write_db = write_db_from_cfg(cfg)
+            persist_gauge_jump_events(write_db, session_id, findings)
+        if args.out:
+            if args.format == "json":
+                export_jumps_json(findings, args.out)
+            else:
+                export_jumps_csv(findings, args.out)
+            print(f"Exported gauge jumps for {session_id} to {args.out}")
+        elif args.json:
+            print(json.dumps([finding.to_dict() for finding in findings], ensure_ascii=False, indent=2))
+        else:
+            print(jumps_to_text(findings))
+        return 0
+    if relearn_mode:
+        config = RelearnConfig.from_auditor_config(cfg)
+        findings = analyze_session_relearn(db, session_id, config=config)
+        if args.persist_events:
+            if _active_collector_may_be_writing(cfg):
+                print("Refusing to persist analyzer events while an active collector may be writing.", file=sys.stderr)
+                return 2
+            db.close()
+            write_db = write_db_from_cfg(cfg)
+            persist_relearn_events(write_db, session_id, findings)
+        if args.out:
+            if args.format == "json":
+                export_relearn_json(findings, args.out)
+            else:
+                export_relearn_csv(findings, args.out)
+            print(f"Exported capacity relearning for {session_id} to {args.out}")
+        elif args.json:
+            print(json.dumps([finding.to_dict() for finding in findings], ensure_ascii=False, indent=2))
+        else:
+            print(relearn_to_text(findings))
         return 0
     summary = summarize_session(db, session_id)
     if args.json:
@@ -401,6 +486,46 @@ def command_repair_db(args: argparse.Namespace, cfg: AuditorConfig) -> int:
     return 0
 
 
+def command_thresholds(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = read_db_from_cfg(cfg)
+    session_id = args.session_id or db.latest_session_id()
+    if session_id is None:
+        print("No sessions found.", file=sys.stderr)
+        return 2
+    if args.threshold_command != "status":
+        print(f"Unknown thresholds command: {args.threshold_command}", file=sys.stderr)
+        return 2
+    statuses = analyze_session_thresholds(db, session_id, cfg)
+    if args.persist_events:
+        if _active_collector_may_be_writing(cfg):
+            print("Refusing to persist threshold events while an active collector may be writing.", file=sys.stderr)
+            return 2
+        rows = db.fetch_session_series(session_id)
+        findings = threshold_event_findings(threshold_samples_from_rows(rows), cfg)
+        db.close()
+        write_db = write_db_from_cfg(cfg)
+        persist_threshold_events(write_db, session_id, findings)
+    if args.json:
+        print(thresholds_to_json(statuses))
+    else:
+        print(thresholds_to_text(statuses))
+    return 0
+
+
+def command_estimate(args: argparse.Namespace, cfg: AuditorConfig) -> int:
+    db = read_db_from_cfg(cfg)
+    session_id = args.session_id or db.latest_session_id()
+    if session_id is None:
+        print("No sessions found.", file=sys.stderr)
+        return 2
+    estimate = estimate_session(db, session_id, cfg)
+    if args.json:
+        print(estimate_to_json(estimate))
+    else:
+        print(estimate_to_text(estimate))
+    return 0
+
+
 def command_tlp_stat(args: argparse.Namespace) -> int:
     client = TlpClient(use_sudo=not args.no_sudo)
     if args.section == "battery":
@@ -447,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
         "export": command_export,
         "recover": command_recover,
         "repair-db": command_repair_db,
+        "thresholds": command_thresholds,
+        "estimate": command_estimate,
     }
     if args.command in commands:
         return int(commands[args.command](args, cfg))

@@ -30,6 +30,24 @@ battery-auditor once
 python -m pip install -e .
 ```
 
+## Optional sleep hooks
+
+The collector can optionally listen for logind `PrepareForSleep` D-Bus signals. This is not required for normal collection:
+
+```bash
+python -m pip install -e '.[system]'
+```
+
+Then enable it in `config.toml`:
+
+```toml
+[sleep_monitor]
+enabled = true
+backend = "logind"
+```
+
+If the optional D-Bus dependency or logind signal is unavailable, the collector records `SLEEP_MONITOR_UNAVAILABLE` and keeps running. Gap classification from wall-clock and monotonic timestamps remains the fallback.
+
 ## UI Qt
 
 The UI uses PySide6 and pyqtgraph. You can install both with pip:
@@ -59,3 +77,5 @@ Then:
 systemctl --user daemon-reload
 systemctl --user restart battery-auditor.service
 ```
+
+The sleep monitor is designed to work from the user service when the user bus can connect to system logind. Some distributions or hardening profiles may require a system-level service for the most reliable sleep hooks; Battery Auditor does not install or require one by default.

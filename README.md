@@ -124,6 +124,35 @@ battery-auditor analyze phases
 battery-auditor analyze --phases <session_id>
 ```
 
+Show physically impossible or suspicious fuel-gauge jumps:
+
+```bash
+battery-auditor analyze jumps
+battery-auditor analyze --jumps <session_id>
+```
+
+Show reported full-capacity relearning:
+
+```bash
+battery-auditor analyze relearn
+battery-auditor analyze --relearn <session_id>
+```
+
+Show configured vs sysfs charge threshold readback:
+
+```bash
+battery-auditor thresholds status
+battery-auditor thresholds status <session_id>
+```
+
+Estimate effective charge state and runtime:
+
+```bash
+battery-auditor estimate
+battery-auditor estimate --session <session_id>
+battery-auditor estimate --json
+```
+
 Export phases:
 
 ```bash
@@ -234,6 +263,30 @@ Example output:
 2  2023-11-14 22:21:20  2023-11-14 22:24:20  3m00s  off  DISCHARGE_BAT1  BAT1   -     0.000     -3.000    -3.000
 ```
 
+## Gauge jump analysis
+
+Fuel-gauge percentages are firmware estimates, not direct measurements of real remaining energy. The reported `capacity` value can be smoothed, rounded, stale, or recalibrated by the embedded controller, so it is not always equal to the Wh-based percentage from `energy_now / energy_full`.
+
+`battery-auditor analyze jumps` compares consecutive samples per battery. It checks whether the observed `energy_now` change is plausible for the elapsed time and reported `power_now`, with noise tolerance, and also flags large reported percentage jumps. Low-end jumps below 25% are classified as `LOW_END_GAUGE_JUMP` because this is where bad calibration can hide shutdown risk. These findings lower confidence in later runtime and health conclusions: a battery that drops from about 18% to 6% in one sample may still have usable cells, but its gauge can no longer be trusted as a smooth remaining-energy signal.
+
+## Capacity relearning
+
+`battery-auditor analyze relearn` scans stored samples for changes in each battery's reported `energy_full` and `energy_full_design`. A change such as 18.28 Wh to 19.91 Wh is reported as `ENERGY_FULL_RELEARN` when it is larger than the configured absolute and relative thresholds.
+
+This does not mean the battery physically recovered; it means the reported full capacity changed. Embedded controllers can relearn or reconcile the full-capacity estimate after deep discharge, full charge, resume, or other firmware events. Because `computed_percent` is `energy_now / energy_full`, a relearn can change effective percent and ETA models even when the actual stored energy did not suddenly change.
+
+## Effective battery estimate
+
+`battery-auditor estimate` reports an estimated effective pack percentage and runtime ETA with confidence. It does not claim absolute truth. It combines observed Wh, current learned `energy_full`, routing between packs, low-end gauge jump history, threshold state, and recent discharge-only consumption.
+
+The terms are:
+
+- raw percent: the kernel/firmware `capacity` percentage;
+- computed percent: `energy_now / energy_full * 100`;
+- effective percent: usable Wh after small uncertainty/reserve margins divided by learned pack full Wh.
+
+ETA uses recent discharge samples only. AC-connected periods, charging samples, AC transitions, and probable suspend gaps are excluded. The nominal ETA prefers the medium window, while pessimistic and optimistic values use higher and lower stable recent consumption. If there is not enough discharge data, the ETA is unknown and confidence is low.
+
 ## User systemd services
 
 Install units:
@@ -255,6 +308,22 @@ systemctl --user start battery-auditor-blackbox.service
 ```
 
 The UI and `battery-auditor status` detect these systemd-started collectors through the same lock and heartbeat files.
+
+Optional sleep/resume hooks:
+
+```bash
+python -m pip install 'battery-auditor[system]'
+```
+
+Then enable the logind monitor in config:
+
+```toml
+[sleep_monitor]
+enabled = true
+backend = "logind"
+```
+
+When available, the collector records `ABOUT_TO_SLEEP` before suspend and `RESUMED` after resume, then takes one immediate battery sample and records `RESUME_SAMPLE_TAKEN`. If the optional D-Bus dependency or logind hook is unavailable, it records `SLEEP_MONITOR_UNAVAILABLE` and continues. Wall-time/monotonic gap classification remains the fallback and source of truth when hooks are missed. A sudden power cut can prevent `ABOUT_TO_SLEEP` from being written.
 
 View logs:
 
@@ -284,6 +353,12 @@ battery-auditor tlp-recalibrate BAT1
 ```
 
 TLP actions are manual and are not part of the periodic collector, so they do not contaminate measurements.
+
+## Threshold watchdog
+
+Charge thresholds can be configured in TLP while the live sysfs readback reports something else. On some systems the expected 75/80 thresholds can temporarily appear as 0/100 after firmware, resume, or power-management events. That matters because the battery may charge outside the intended preservation window even though the user-space configuration still looks correct.
+
+`battery-auditor thresholds status` compares configured thresholds with the latest stored sysfs readback from `charge_control_start_threshold` / `charge_control_end_threshold`, falling back to `charge_start_threshold` / `charge_stop_threshold` when needed. It does not run privileged commands and does not auto-restore thresholds. TLP config, UPower, and sysfs can disagree because they observe or manage different layers; the watchdog treats sysfs as the current kernel readback and reports `OK`, `MISMATCH`, or `UNKNOWN`.
 
 ## Recorded data
 
@@ -315,11 +390,11 @@ Pay special attention to:
 [sampling]
 interval_seconds = 2.0
 
-[expected_thresholds.BAT0]
+[thresholds.BAT0]
 start = 75
 stop = 80
 
-[expected_thresholds.BAT1]
+[thresholds.BAT1]
 start = 75
 stop = 80
 ```

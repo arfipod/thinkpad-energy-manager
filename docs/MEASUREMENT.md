@@ -50,6 +50,10 @@ battery-auditor collect --mode blackbox --name final-discharge
 ```bash
 battery-auditor sessions
 battery-auditor analyze
+battery-auditor analyze jumps
+battery-auditor analyze relearn
+battery-auditor thresholds status
+battery-auditor estimate
 battery-auditor export --format csv --out discharge.csv
 ```
 
@@ -59,8 +63,17 @@ battery-auditor export --format csv --out discharge.csv
 
 - sudden jump in `capacity_percent`;
 - gap between `capacity_percent` and `computed_percent`;
+- `LOW_END_GAUGE_JUMP`, `IMPOSSIBLE_ENERGY_DROP`, or `RECOVERY_JUMP` from `battery-auditor analyze jumps`;
 - shutdown when `energy_now` still seems sufficient;
 - improvement after recalibration.
+
+The reported `capacity_percent` is a fuel-gauge estimate. It can be rounded, filtered, stale, or abruptly reconciled by firmware. The Wh-based `computed_percent` is derived from `energy_now / energy_full`, but even `energy_now` can jump when the embedded controller corrects its estimate. Impossible gauge jumps reduce confidence in runtime projections and in conclusions drawn from a single low-battery sample.
+
+### Capacity relearning
+
+`energy_full` is the battery or embedded controller's current estimate of usable full capacity. It can change after a deep discharge/charge cycle without the cells physically improving. For example, a move from 18.28 Wh to 19.91 Wh can make health appear to jump from about 78% to about 85%, but that is gauge relearning, not repair.
+
+Run `battery-auditor analyze relearn` after calibration tests. Relearn findings affect effective percentage and ETA modeling because the denominator for `energy_now / energy_full` changed; comparisons before and after the relearn should account for that boundary.
 
 ### Probable physical degradation
 
@@ -74,6 +87,22 @@ battery-auditor export --format csv --out discharge.csv
 - one battery discharges first;
 - the other remains stable;
 - the active battery changes without abrupt energy jumps.
+
+### Threshold mismatches
+
+If you rely on TLP charge thresholds, check `battery-auditor thresholds status` after resume, recalibration, or unusual charge behavior. The TLP configuration, UPower view, and sysfs readback can disagree. Battery Auditor records sysfs values from the collector and reports mismatches offline, for example configured `75/80` but current sysfs `0/100`. This warns that the kernel-visible thresholds may not be enforcing the preservation window you intended.
+
+### Sleep and resume
+
+With the optional logind sleep monitor enabled, the collector records `ABOUT_TO_SLEEP` and `RESUMED` events and takes an immediate post-resume sample. This helps distinguish a normal suspend from a low-battery shutdown during black-box tests.
+
+The monitor is best-effort. A sudden power cut can prevent `ABOUT_TO_SLEEP` from being written, and some systems may miss D-Bus hooks. The wall-clock and monotonic timestamp gap remains the fallback and source of truth for classifying resume-like gaps.
+
+### Effective percent and ETA
+
+`battery-auditor estimate` is a model, not a truth oracle. Raw percent is the kernel `capacity` field. Computed percent is `energy_now / energy_full`. Effective percent starts from observed Wh and learned full capacity, then applies configured reserve and uncertainty margins when the gauge is less trustworthy.
+
+The ETA model uses recent discharge-only consumption windows: short, medium, and long. AC-connected periods, charging samples, AC transitions, and probable suspend gaps are excluded. Nominal ETA uses the medium window when enough data exists; pessimistic ETA uses higher recent consumption; optimistic ETA uses lower stable consumption. If there is not enough usable discharge history, Battery Auditor reports unknown ETA and lowers confidence instead of inventing precision.
 
 ## Avoid contaminating the test
 

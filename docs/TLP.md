@@ -45,16 +45,24 @@ The collector records these paths if they exist:
 You can define expected thresholds in `config.toml`:
 
 ```toml
-[expected_thresholds.BAT0]
+[thresholds.BAT0]
 start = 75
 stop = 80
 
-[expected_thresholds.BAT1]
+[thresholds.BAT1]
 start = 75
 stop = 80
 ```
 
-If the value read from sysfs does not match, `THRESHOLD_MISMATCH` is recorded.
+If the value read from sysfs does not match, `THRESHOLD_MISMATCH` is recorded. When readback returns to the configured values, `THRESHOLD_RESTORED` can be recorded; if readback is missing, the watchdog reports `THRESHOLD_UNKNOWN`.
+
+Use the offline watchdog to summarize the latest readback:
+
+```bash
+battery-auditor thresholds status
+```
+
+TLP configuration, UPower, and sysfs can disagree. Battery Auditor does not treat TLP config as proof that the kernel-visible thresholds are active; it compares the configured target with the sysfs values captured by the collector.
 
 ## Design note
 

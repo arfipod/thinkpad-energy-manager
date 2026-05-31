@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import fcntl
 import os
+import queue
 import signal
+import threading
 import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TextIO
+from typing import Callable, TextIO
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.database import BatteryDatabase
@@ -28,6 +30,14 @@ from battery_auditor.core.sysfs import (
     read_snapshot,
     read_system_load_metrics,
 )
+from battery_auditor.core.sleep_monitor import (
+    RESUMED,
+    RESUME_SAMPLE_TAKEN,
+    SLEEP_MONITOR_UNAVAILABLE,
+    SleepMonitor,
+    SleepMonitorEvent,
+    build_sleep_monitor,
+)
 
 
 @dataclass(slots=True)
@@ -38,7 +48,13 @@ class CollectorRunResult:
 
 
 class BatteryCollector:
-    def __init__(self, cfg: AuditorConfig, db: BatteryDatabase | None = None) -> None:
+    def __init__(
+        self,
+        cfg: AuditorConfig,
+        db: BatteryDatabase | None = None,
+        *,
+        sleep_monitor_factory: Callable[[Callable[[SleepMonitorEvent], None]], SleepMonitor] | None = None,
+    ) -> None:
         self.cfg = cfg
         self.db = db or BatteryDatabase(cfg.resolved_db_path(), cfg)
         self.stop_requested = False
@@ -47,6 +63,10 @@ class BatteryCollector:
         self._control_mtime_ns: int | None = None
         self._pause_requested = False
         self._previous_system_load: SystemLoadCounters | None = None
+        self._sleep_monitor_factory = sleep_monitor_factory
+        self._sleep_monitor: SleepMonitor | None = None
+        self._sleep_events: queue.Queue[SleepMonitorEvent] = queue.Queue()
+        self._wake_event = threading.Event()
 
     def request_stop(self, *_args: object) -> None:
         self.stop_requested = True
@@ -84,6 +104,7 @@ class BatteryCollector:
             session_id = self._new_session_id()
             self.db.start_session(session_id=session_id, name=name, cfg_json=self.cfg.to_json())
             self.install_signal_handlers()
+            self._start_sleep_monitor(session_id)
 
             reason = "stopped"
             seq = 0
@@ -93,6 +114,10 @@ class BatteryCollector:
             last_heartbeat_wall = 0.0
             try:
                 while not self.stop_requested:
+                    resume_requested, sleep_event_seen = self._drain_sleep_monitor_events(session_id)
+                    if sleep_event_seen and (blackbox or self.cfg.blackbox_flush_each_sample):
+                        self.db.flush_to_disk()
+                    self._wake_event.clear()
                     now_mono = time.monotonic()
                     if duration_seconds is not None and now_mono - started_mono >= duration_seconds:
                         reason = "duration_elapsed"
@@ -127,15 +152,28 @@ class BatteryCollector:
                             last_heartbeat_wall = now_wall
                             if blackbox or self.cfg.blackbox_flush_each_sample:
                                 self.db.flush_to_disk()
-                        time.sleep(min(1.0, heartbeat_interval))
+                        self._wait(min(1.0, heartbeat_interval))
                         continue
+                    if resume_requested:
+                        next_deadline = now_mono
                     if now_mono < next_deadline:
-                        time.sleep(min(0.25, next_deadline - now_mono))
+                        self._wait(min(0.25, next_deadline - now_mono))
                         continue
 
                     loop_delay_ms = max(0.0, (now_mono - next_deadline) * 1000.0) if seq > 0 else 0.0
                     snap = self._sample(loop_delay_ms=loop_delay_ms)
                     events = self.detector.process(snap)
+                    if resume_requested:
+                        events.append(
+                            Event(
+                                RESUME_SAMPLE_TAKEN,
+                                "info",
+                                "Immediate battery sample taken after resume.",
+                                wall_time=snap.wall_time,
+                                monotonic_time=snap.monotonic_time,
+                                details={"source": "sleep_monitor"},
+                            )
+                        )
                     self.db.insert_snapshot(session_id, seq, snap, events)
                     self.db.update_heartbeat(session_id, snap.wall_time, snap.wall_iso, snap.monotonic_time)
                     self._write_heartbeat_file(
@@ -178,6 +216,8 @@ class BatteryCollector:
                 self._remove_heartbeat_file(session_id)
                 with suppress(Exception):
                     write_control_state(self.cfg, paused=False)
+                with suppress(Exception):
+                    self._stop_sleep_monitor()
                 if blackbox or self.cfg.blackbox_flush_each_sample:
                     with suppress(Exception):
                         self.db.flush_to_disk()
@@ -210,6 +250,68 @@ class BatteryCollector:
         snap.metrics.wifi_enabled = _bool_or_none(system_metrics["wifi_enabled"])
         snap.metrics.bluetooth_enabled = _bool_or_none(system_metrics["bluetooth_enabled"])
         return snap
+
+    def _start_sleep_monitor(self, session_id: str) -> None:
+        if self._sleep_monitor_factory is not None:
+            monitor = self._sleep_monitor_factory(self._enqueue_sleep_monitor_event)
+        else:
+            monitor = build_sleep_monitor(
+                enabled=self.cfg.sleep_monitor_enabled,
+                backend=self.cfg.sleep_monitor_backend,
+                callback=self._enqueue_sleep_monitor_event,
+            )
+        self._sleep_monitor = monitor
+        unavailable = monitor.start()
+        if unavailable is not None:
+            now = time.time()
+            self.db.insert_event(
+                session_id,
+                Event(
+                    SLEEP_MONITOR_UNAVAILABLE,
+                    "warning",
+                    "Sleep monitor is unavailable; falling back to wall/monotonic gap classification.",
+                    wall_time=now,
+                    monotonic_time=time.monotonic(),
+                    details={"backend": unavailable.backend, "reason": unavailable.reason},
+                ),
+            )
+
+    def _stop_sleep_monitor(self) -> None:
+        if self._sleep_monitor is None:
+            return
+        self._sleep_monitor.stop()
+        self._sleep_monitor = None
+
+    def _enqueue_sleep_monitor_event(self, event: SleepMonitorEvent) -> None:
+        self._sleep_events.put(event)
+        self._wake_event.set()
+
+    def _drain_sleep_monitor_events(self, session_id: str) -> tuple[bool, bool]:
+        resume_seen = False
+        event_seen = False
+        while True:
+            try:
+                event = self._sleep_events.get_nowait()
+            except queue.Empty:
+                break
+            event_seen = True
+            self.db.insert_event(
+                session_id,
+                Event(
+                    event.event_type,
+                    "info",
+                    "System is about to sleep." if event.event_type != RESUMED else "System resumed from sleep.",
+                    wall_time=event.wall_time,
+                    monotonic_time=event.monotonic_time,
+                    details={"backend": event.backend},
+                ),
+            )
+            if event.event_type == RESUMED:
+                resume_seen = True
+        return resume_seen, event_seen
+
+    def _wait(self, seconds: float) -> None:
+        self._wake_event.wait(timeout=max(0.0, seconds))
 
     def _new_session_id(self) -> str:
         timestamp = time.strftime("%Y%m%d-%H%M%S")

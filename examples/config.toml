@@ -14,6 +14,33 @@ percent_jump_threshold = 5.0
 voltage_sag_percent_threshold = 6.0
 sample_delay_warn_factor = 2.5
 
+[sleep_monitor]
+# Optional event-driven logind D-Bus monitor. Requires installing battery-auditor[system].
+enabled = false
+backend = "logind"
+
+[analysis]
+gauge_jump_absolute_tolerance_wh = 0.10
+gauge_jump_relative_tolerance = 3.0
+gauge_jump_low_end_percent = 25.0
+gauge_jump_transition_window_seconds = 5.0
+# Set this only if your sampling profile treats longer gaps as suspend/resume reconciliations.
+# gauge_jump_suspend_gap_seconds = 30.0
+relearn_min_absolute_change_wh = 0.25
+relearn_min_relative_change_percent = 1.0
+relearn_context_window_seconds = 3600.0
+relearn_resume_gap_seconds = 300.0
+model_low_end_percent = 25.0
+model_low_end_margin_fraction = 0.10
+model_global_critical_reserve_wh = 0.0
+model_relearn_stable_samples = 3
+model_eta_short_window_seconds = 60.0
+model_eta_medium_window_seconds = 300.0
+model_eta_long_window_seconds = 900.0
+model_min_eta_pairs = 2
+model_ac_transition_exclusion_seconds = 5.0
+model_suspend_gap_seconds = 120.0
+
 [sqlite]
 # WAL is good for the normal UI/collector workflow. blackbox mode uses TRUNCATE.
 journal_mode = "WAL"
@@ -22,10 +49,10 @@ synchronous = "NORMAL"
 wal_autocheckpoint_pages = 200
 blackbox_flush_each_sample = false
 
-[expected_thresholds.BAT0]
+[thresholds.BAT0]
 start = 75
 stop = 80
 
-[expected_thresholds.BAT1]
+[thresholds.BAT1]
 start = 75
 stop = 80

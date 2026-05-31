@@ -14,6 +14,7 @@ from typing import Any
 
 from battery_auditor.config import AuditorConfig, load_config
 from battery_auditor.core.analyzer import export_session_csv
+from battery_auditor.core.battery_model import estimate_session, estimate_to_text
 from battery_auditor.core.database import BatteryDatabase, repair_database
 from battery_auditor.core.runtime import (
     STATUS_PAUSED,
@@ -23,6 +24,7 @@ from battery_auditor.core.runtime import (
     collect_runtime_status,
 )
 from battery_auditor.core.sysfs import read_snapshot
+from battery_auditor.core.thresholds import STATUS_MISMATCH, analyze_session_thresholds
 from battery_auditor.core.tlp import TlpClient
 from battery_auditor.ui.session_manager import SessionManager
 
@@ -37,7 +39,7 @@ PERSISTENT_DATABASE_ERROR_MARKERS = (
 try:
     import pyqtgraph as pg  # type: ignore[import-untyped]
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QAction
+    from PySide6.QtGui import QAction, QColor
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -428,8 +430,14 @@ class MainWindow(QMainWindow):
         row.addWidget(refresh)
         self.live_text = QPlainTextEdit()
         self.live_text.setReadOnly(True)
+        self.estimate_text = QPlainTextEdit()
+        self.estimate_text.setReadOnly(True)
+        self.estimate_text.setMaximumHeight(220)
         layout.addLayout(row)
         layout.addWidget(self.db_status_label)
+        layout.addWidget(QLabel("Estimate"))
+        layout.addWidget(self.estimate_text)
+        layout.addWidget(QLabel("Live sysfs snapshot"))
         layout.addWidget(self.live_text)
         return widget
 
@@ -651,6 +659,20 @@ class MainWindow(QMainWindow):
         form.addStretch(1)
         layout.addLayout(form)
 
+        threshold_row = QHBoxLayout()
+        threshold_refresh = QPushButton("Refresh threshold status")
+        threshold_refresh.clicked.connect(self.refresh_thresholds)
+        threshold_row.addWidget(QLabel("Configured vs current sysfs thresholds"))
+        threshold_row.addStretch(1)
+        threshold_row.addWidget(threshold_refresh)
+        layout.addLayout(threshold_row)
+
+        self.thresholds_table = QTableWidget(0, 6)
+        self.thresholds_table.setHorizontalHeaderLabels(
+            ["Battery", "Configured", "Current sysfs", "Mismatch", "Last OK", "Last mismatch"]
+        )
+        layout.addWidget(self.thresholds_table)
+
         self.tlp_output = QPlainTextEdit()
         self.tlp_output.setReadOnly(True)
         layout.addWidget(self.tlp_output)
@@ -669,9 +691,11 @@ class MainWindow(QMainWindow):
             prefer_running_session=prefer_running_session,
             preferred_session_id=preferred_session_id,
         )
+        self.refresh_estimate()
         self.refresh_live_snapshot()
         self.refresh_chart()
         self.refresh_events()
+        self.refresh_thresholds()
 
     def refresh_sessions(
         self,
@@ -763,6 +787,26 @@ class MainWindow(QMainWindow):
         snap = read_snapshot(self.cfg.sysfs_power_supply_dir)
         data = snap.to_dict()
         self.live_text.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+
+    def refresh_estimate(self) -> None:
+        if not hasattr(self, "estimate_text"):
+            return
+        if not self.db_available:
+            self.estimate_text.setPlainText("Database unavailable.")
+            return
+        session_id = self.session_combo.currentData() if hasattr(self, "session_combo") else None
+        if not session_id:
+            self.estimate_text.setPlainText("No session selected.")
+            return
+        try:
+            estimate = estimate_session(self.db, str(session_id), self.cfg)
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            if isinstance(exc, sqlite3.DatabaseError):
+                self._set_database_unavailable(exc)
+                self._show_database_error()
+            self.estimate_text.setPlainText("Estimate unavailable.")
+            return
+        self.estimate_text.setPlainText(estimate_to_text(estimate))
 
     def refresh_chart(self, _checked: bool = False, *, force: bool = False) -> None:
         if not self.db_available:
@@ -895,6 +939,53 @@ class MainWindow(QMainWindow):
             for col, value in enumerate(values):
                 self.events_table.setItem(row_idx, col, QTableWidgetItem(value))
         self.events_table.resizeColumnsToContents()
+
+    def refresh_thresholds(self) -> None:
+        if not hasattr(self, "thresholds_table"):
+            return
+        if not self.db_available:
+            self.thresholds_table.setRowCount(0)
+            return
+        session_id = self.session_combo.currentData() if hasattr(self, "session_combo") else None
+        if not session_id:
+            self.thresholds_table.setRowCount(0)
+            return
+        try:
+            statuses = analyze_session_thresholds(self.db, str(session_id), self.cfg)
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            if isinstance(exc, sqlite3.DatabaseError):
+                self._set_database_unavailable(exc)
+                self._show_database_error()
+            self.thresholds_table.setRowCount(0)
+            return
+        self.thresholds_table.setRowCount(len(statuses))
+        for row_idx, status in enumerate(statuses):
+            values = [
+                status.battery_name,
+                self._format_threshold_pair(status.configured_start_threshold, status.configured_stop_threshold),
+                self._format_threshold_pair(status.sysfs_start_threshold, status.sysfs_stop_threshold),
+                "yes" if status.mismatch else "no",
+                self._short_ui_iso(status.last_ok_wall_iso),
+                self._short_ui_iso(status.last_mismatch_wall_iso),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if status.status == STATUS_MISMATCH:
+                    item.setBackground(QColor("#4a1f1f"))
+                self.thresholds_table.setItem(row_idx, col, item)
+        self.thresholds_table.resizeColumnsToContents()
+
+    @staticmethod
+    def _format_threshold_pair(start: int | None, stop: int | None) -> str:
+        if start is None or stop is None:
+            return "-"
+        return f"{start}/{stop}"
+
+    @staticmethod
+    def _short_ui_iso(value: str | None) -> str:
+        if value is None:
+            return "-"
+        return value.replace("T", " ").split("+", maxsplit=1)[0]
 
     def export_selected_session_csv(self) -> None:
         if not self.db_available:

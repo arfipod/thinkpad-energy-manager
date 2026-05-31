@@ -109,7 +109,7 @@ One row per non-battery power supply and sample.
 
 ## `events`
 
-Derived events.
+Derived events. Collector events are written during sampling. Analyzer findings such as gauge jumps, capacity relearning, and threshold watchdog status changes can also be persisted into this table when requested; their structured fields are stored in `details_json` without requiring a schema migration.
 
 - `event_type`
 - `severity`

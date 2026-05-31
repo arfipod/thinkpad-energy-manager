@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from battery_auditor.config import AuditorConfig
 from battery_auditor.core.models import BatterySnapshot, Event, SystemSnapshot
+from battery_auditor.core.thresholds import STATUS_MISMATCH, STATUS_OK, STATUS_UNKNOWN, status_for_snapshot
 
 
 @dataclass(slots=True)
@@ -14,6 +15,7 @@ class EventDetector:
     critical_seen: bool = False
     last_active_discharge: str | None = None
     threshold_warned: set[str] = field(default_factory=set)
+    threshold_status: dict[str, str] = field(default_factory=dict)
 
     def process(self, snap: SystemSnapshot) -> list[Event]:
         events: list[Event] = []
@@ -142,18 +144,37 @@ class EventDetector:
                 "actual_start": actual_start,
                 "actual_stop": actual_stop,
             }
-            if expected.start is not None and actual_start is not None and expected.start != actual_start:
+            status = status_for_snapshot(battery.name, expected, actual_start, actual_stop)
+            previous_status = self.threshold_status.get(battery.name)
+            self.threshold_status[battery.name] = status
+            if status == STATUS_MISMATCH:
                 mismatch = True
-            if expected.stop is not None and actual_stop is not None and expected.stop != actual_stop:
-                mismatch = True
-            key = f"{battery.name}:{expected.start}:{expected.stop}:{actual_start}:{actual_stop}"
-            if mismatch and key not in self.threshold_warned:
-                self.threshold_warned.add(key)
+            if mismatch and previous_status != STATUS_MISMATCH:
                 events.append(
                     Event(
                         "THRESHOLD_MISMATCH",
                         "warning",
                         f"{battery.name}: actual charge thresholds do not match expected thresholds.",
+                        battery_name=battery.name,
+                        details=details,
+                    )
+                )
+            elif status == STATUS_UNKNOWN and previous_status != STATUS_UNKNOWN:
+                events.append(
+                    Event(
+                        "THRESHOLD_UNKNOWN",
+                        "info",
+                        f"{battery.name}: charge threshold readback is unknown.",
+                        battery_name=battery.name,
+                        details=details,
+                    )
+                )
+            elif status == STATUS_OK and previous_status in {STATUS_MISMATCH, STATUS_UNKNOWN}:
+                events.append(
+                    Event(
+                        "THRESHOLD_RESTORED",
+                        "info",
+                        f"{battery.name}: charge thresholds match expected values again.",
                         battery_name=battery.name,
                         details=details,
                     )
