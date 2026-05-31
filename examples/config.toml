@@ -1,6 +1,6 @@
 [general]
-# data_dir = "~/.local/state/battery-auditor"
-# db_path = "~/.local/state/battery-auditor/battery-auditor.sqlite3"
+# data_dir = "~/.local/state/thinkpad-energy-manager"
+# db_path = "~/.local/state/thinkpad-energy-manager/thinkpad-energy-manager.sqlite3"
 # sysfs_power_supply_dir = "/sys/class/power_supply"
 
 [sampling]
@@ -15,7 +15,7 @@ voltage_sag_percent_threshold = 6.0
 sample_delay_warn_factor = 2.5
 
 [sleep_monitor]
-# Optional event-driven logind D-Bus monitor. Requires installing battery-auditor[system].
+# Optional event-driven logind D-Bus monitor. Requires installing thinkpad-energy-manager[system].
 enabled = false
 backend = "logind"
 

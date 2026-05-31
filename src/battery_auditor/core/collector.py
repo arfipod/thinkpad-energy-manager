@@ -450,7 +450,7 @@ class BatteryCollector:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             lock_file.close()
-            raise RuntimeError(f"Another Battery Auditor collector is already running: {path}") from exc
+            raise RuntimeError(f"Another ThinkPad Energy Manager collector is already running: {path}") from exc
         write_lock_payload(lock_file)
         self._lock_file = lock_file
 

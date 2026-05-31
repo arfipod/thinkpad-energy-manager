@@ -1,6 +1,6 @@
-"""Battery Auditor.
+"""ThinkPad Energy Manager.
 
-Low-impact battery recorder and diagnostics toolkit for Linux laptops.
+ThinkPad battery, lighting, radio, and power-management toolkit for Linux laptops.
 """
 
 from __future__ import annotations

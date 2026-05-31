@@ -1,13 +1,13 @@
 # TLP integration
 
-Battery Auditor does not replace TLP. It records data and provides manual shortcuts.
+ThinkPad Energy Manager does not replace TLP. It records data and provides manual shortcuts.
 
 ## TLP diagnostics
 
 ```bash
-battery-auditor tlp-stat battery
-battery-auditor tlp-stat config
-battery-auditor tlp-stat system
+thinkpad-energy-manager tlp-stat battery
+thinkpad-energy-manager tlp-stat config
+thinkpad-energy-manager tlp-stat system
 ```
 
 These commands may ask for `sudo`.
@@ -15,8 +15,8 @@ These commands may ask for `sudo`.
 ## Temporary thresholds
 
 ```bash
-battery-auditor tlp-setcharge BAT0 75 80
-battery-auditor tlp-setcharge BAT1 75 80
+thinkpad-energy-manager tlp-setcharge BAT0 75 80
+thinkpad-energy-manager tlp-setcharge BAT1 75 80
 ```
 
 This uses `tlp setcharge`. Changes are temporary unless they are reflected in the TLP configuration.
@@ -24,8 +24,8 @@ This uses `tlp setcharge`. Changes are temporary unless they are reflected in th
 ## Recalibration
 
 ```bash
-battery-auditor tlp-recalibrate BAT0
-battery-auditor tlp-recalibrate BAT1
+thinkpad-energy-manager tlp-recalibrate BAT0
+thinkpad-energy-manager tlp-recalibrate BAT1
 ```
 
 Do this for one battery at a time. During recalibration, it is useful to keep the collector recording so you can compare before/after.
@@ -65,22 +65,22 @@ If the value read from sysfs does not match, `THRESHOLD_MISMATCH` is recorded. W
 Use the offline watchdog to summarize the latest readback:
 
 ```bash
-battery-auditor thresholds status
+thinkpad-energy-manager thresholds status
 ```
 
-TLP configuration, UPower, and sysfs can disagree. Battery Auditor does not treat TLP config as proof that the kernel-visible thresholds are active; it compares the configured target with the sysfs values captured by the collector.
+TLP configuration, UPower, and sysfs can disagree. ThinkPad Energy Manager does not treat TLP config as proof that the kernel-visible thresholds are active; it compares the configured target with the sysfs values captured by the collector.
 
 ## Optional threshold restore
 
-If sysfs reports a mismatch such as `0/100`, you can ask Battery Auditor to restore the configured values through TLP. This is manual by default:
+If sysfs reports a mismatch such as `0/100`, you can ask ThinkPad Energy Manager to restore the configured values through TLP. This is manual by default:
 
 ```bash
-battery-auditor thresholds restore --dry-run
-battery-auditor thresholds restore BAT0 --dry-run
-battery-auditor thresholds restore BAT0 --yes
+thinkpad-energy-manager thresholds restore --dry-run
+thinkpad-energy-manager thresholds restore BAT0 --dry-run
+thinkpad-energy-manager thresholds restore BAT0 --yes
 ```
 
-The command uses `sudo tlp setcharge <start> <stop> BAT*`. Review the dry-run output first. Restoring thresholds can change when the machine charges or stops charging, so automatic restore is disabled unless you set `restore_on_resume = true` or `restore_on_mismatch = true`. If sudo or TLP fails, Battery Auditor records `THRESHOLD_RESTORE_FAILED`; dry runs record `THRESHOLD_RESTORE_DRY_RUN` and never report success.
+The command uses `sudo tlp setcharge <start> <stop> BAT*`. Review the dry-run output first. Restoring thresholds can change when the machine charges or stops charging, so automatic restore is disabled unless you set `restore_on_resume = true` or `restore_on_mismatch = true`. If sudo or TLP fails, ThinkPad Energy Manager records `THRESHOLD_RESTORE_FAILED`; dry runs record `THRESHOLD_RESTORE_DRY_RUN` and never report success.
 
 ## Design note
 

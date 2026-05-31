@@ -9,7 +9,7 @@ The collector only needs to read `/sys/class/power_supply`. It normally does not
 The SQLite database is stored in the user's state directory:
 
 ```text
-~/.local/state/battery-auditor/
+~/.local/state/thinkpad-energy-manager/
 ```
 
 ## TLP

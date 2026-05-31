@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "battery-auditor"
+name = "thinkpad-energy-manager"
 version = "0.1.0"
-description = "Low-impact Linux battery recorder, diagnostics UI, and TLP companion for multi-battery laptops."
+description = "ThinkPad energy, battery, lighting, radio, and power-management controller for Linux."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -34,12 +34,14 @@ system = ["dbus-next>=0.2.3"]
 dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
 
 [project.scripts]
+thinkpad-energy-manager = "battery_auditor.cli:main"
+thinkpad-energy-manager-qt = "battery_auditor.ui.main:main"
 battery-auditor = "battery_auditor.cli:main"
 battery-auditor-qt = "battery_auditor.ui.main:main"
 
 [project.urls]
-Homepage = "https://github.com/arfipod/battery-auditor"
-Issues = "https://github.com/arfipod/battery-auditor/issues"
+Homepage = "https://github.com/arfipod/thinkpad-energy-manager"
+Issues = "https://github.com/arfipod/thinkpad-energy-manager/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

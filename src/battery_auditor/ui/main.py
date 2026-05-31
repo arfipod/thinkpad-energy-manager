@@ -24,6 +24,7 @@ from battery_auditor.core.runtime import (
     collect_runtime_status,
 )
 from battery_auditor.core.sysfs import read_snapshot
+from battery_auditor.core.system_controls import CommandResult, SystemControls
 from battery_auditor.core.thresholds import (
     STATUS_MISMATCH,
     analyze_session_thresholds,
@@ -32,7 +33,7 @@ from battery_auditor.core.thresholds import (
 from battery_auditor.core.tlp import TlpClient
 from battery_auditor.ui.session_manager import SessionManager
 
-BLACKBOX_SERVICE = "battery-auditor-blackbox.service"
+BLACKBOX_SERVICE = "thinkpad-energy-manager-blackbox.service"
 PERSISTENT_DATABASE_ERROR_MARKERS = (
     "database disk image is malformed",
     "file is not a database",
@@ -51,6 +52,7 @@ try:
         QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
+        QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -58,6 +60,7 @@ try:
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QSlider,
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
@@ -70,7 +73,7 @@ try:
 except ImportError as exc:  # pragma: no cover - depends on optional UI extra
     raise SystemExit(
         "PySide6 and pyqtgraph are required for the Qt UI. Install with:\n"
-        "  python -m pip install 'battery-auditor[ui]'\n"
+        "  python -m pip install 'thinkpad-energy-manager[ui]'\n"
         "or install the relevant PySide6 packages plus pyqtgraph."
     ) from exc
 
@@ -94,7 +97,7 @@ class InactivityGuard:
                         inhibit,
                         "--what=sleep:idle",
                         "--mode=block",
-                        "--who=Battery Auditor",
+                        "--who=ThinkPad Energy Manager",
                         "--why=Battery measurement in progress",
                         "sleep",
                         "infinity",
@@ -392,8 +395,9 @@ class MainWindow(QMainWindow):
         self._user_pinned_chart_session = False
         self.inactivity_guard = InactivityGuard(self)
         self.load_process: subprocess.Popen[bytes] | None = None
+        self.system_controls = SystemControls()
 
-        self.setWindowTitle("Battery Auditor")
+        self.setWindowTitle("ThinkPad Energy Manager")
         self.resize(1080, 760)
 
         tabs = QTabWidget()
@@ -403,6 +407,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_charts_tab(), "Charts")
         tabs.addTab(self._build_events_tab(), "Events")
         tabs.addTab(self._build_tlp_tab(), "TLP")
+        tabs.addTab(self._build_system_controls_tab(), "ThinkPad")
         self.setCentralWidget(tabs)
 
         refresh_action = QAction("Refresh", self)
@@ -685,6 +690,148 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tlp_output)
         return widget
 
+    def _build_system_controls_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        top = QHBoxLayout()
+        refresh = QPushButton("Refresh devices")
+        refresh.clicked.connect(self.refresh_system_controls)
+        self.system_backend_label = QLabel("")
+        top.addWidget(refresh)
+        top.addWidget(self.system_backend_label)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        brightness_group = QGroupBox("Display brightness")
+        brightness_layout = QVBoxLayout(brightness_group)
+        brightness_form = QHBoxLayout()
+        self.backlight_combo = QComboBox()
+        self.backlight_slider = QSlider(Qt.Orientation.Horizontal)
+        self.backlight_slider.setRange(0, 100)
+        self.backlight_value = QSpinBox()
+        self.backlight_value.setRange(0, 100)
+        self.backlight_value.setSuffix(" %")
+        apply_backlight = QPushButton("Apply")
+        self.backlight_combo.currentIndexChanged.connect(self._select_backlight)
+        self.backlight_slider.valueChanged.connect(self.backlight_value.setValue)
+        self.backlight_value.valueChanged.connect(self.backlight_slider.setValue)
+        apply_backlight.clicked.connect(self.apply_backlight)
+        brightness_form.addWidget(QLabel("Device"))
+        brightness_form.addWidget(self.backlight_combo)
+        brightness_form.addWidget(self.backlight_slider, 1)
+        brightness_form.addWidget(self.backlight_value)
+        brightness_form.addWidget(apply_backlight)
+        brightness_layout.addLayout(brightness_form)
+        self.backlight_table = QTableWidget(0, 5)
+        self.backlight_table.setHorizontalHeaderLabels(["Device", "Current", "Max", "Percent", "Writable"])
+        brightness_layout.addWidget(self.backlight_table)
+        layout.addWidget(brightness_group)
+
+        lights_group = QGroupBox("ThinkPad and system lights")
+        lights_layout = QVBoxLayout(lights_group)
+        lights_form = QHBoxLayout()
+        self.led_combo = QComboBox()
+        self.led_value = QSpinBox()
+        self.led_value.setRange(0, 255)
+        apply_led = QPushButton("Apply")
+        self.led_combo.currentIndexChanged.connect(self._select_led)
+        apply_led.clicked.connect(self.apply_led)
+        lights_form.addWidget(QLabel("LED"))
+        lights_form.addWidget(self.led_combo, 1)
+        lights_form.addWidget(QLabel("Brightness"))
+        lights_form.addWidget(self.led_value)
+        lights_form.addWidget(apply_led)
+        lights_layout.addLayout(lights_form)
+        self.led_table = QTableWidget(0, 5)
+        self.led_table.setHorizontalHeaderLabels(["LED", "Current", "Max", "Trigger", "Writable"])
+        lights_layout.addWidget(self.led_table)
+        layout.addWidget(lights_group)
+
+        radios_group = QGroupBox("Wireless radios")
+        radios_layout = QVBoxLayout(radios_group)
+        radios_form = QHBoxLayout()
+        self.rfkill_combo = QComboBox()
+        enable_radio = QPushButton("Enable")
+        disable_radio = QPushButton("Disable")
+        enable_radio.clicked.connect(lambda: self.apply_rfkill(True))
+        disable_radio.clicked.connect(lambda: self.apply_rfkill(False))
+        radios_form.addWidget(QLabel("Radio"))
+        radios_form.addWidget(self.rfkill_combo, 1)
+        radios_form.addWidget(enable_radio)
+        radios_form.addWidget(disable_radio)
+        radios_layout.addLayout(radios_form)
+        self.rfkill_table = QTableWidget(0, 6)
+        self.rfkill_table.setHorizontalHeaderLabels(["Device", "Type", "Name", "Soft block", "Hard block", "Enabled"])
+        radios_layout.addWidget(self.rfkill_table)
+        layout.addWidget(radios_group)
+
+        power_group = QGroupBox("Energy actions")
+        power_layout = QVBoxLayout(power_group)
+        screen_row = QHBoxLayout()
+        self.screen_timeout_seconds = QSpinBox()
+        self.screen_timeout_seconds.setRange(0, 86_400)
+        self.screen_timeout_seconds.setValue(600)
+        self.screen_timeout_seconds.setSuffix(" s")
+        apply_screen_timeout = QPushButton("Set screen timeout")
+        apply_screen_timeout.clicked.connect(self.apply_screen_timeout)
+        screen_row.addWidget(QLabel("Screen off / idle"))
+        screen_row.addWidget(self.screen_timeout_seconds)
+        screen_row.addWidget(apply_screen_timeout)
+        screen_row.addStretch(1)
+        power_layout.addLayout(screen_row)
+
+        sleep_form = QHBoxLayout()
+        self.sleep_source = QComboBox()
+        self.sleep_source.addItems(["battery", "ac"])
+        self.sleep_timeout_seconds = QSpinBox()
+        self.sleep_timeout_seconds.setRange(0, 86_400)
+        self.sleep_timeout_seconds.setValue(900)
+        self.sleep_timeout_seconds.setSuffix(" s")
+        self.sleep_action = QComboBox()
+        self.sleep_action.addItems(["suspend", "hibernate", "nothing"])
+        apply_sleep = QPushButton("Set inactivity action")
+        apply_sleep.clicked.connect(self.apply_sleep_timeout)
+        sleep_form.addWidget(QLabel("When on"))
+        sleep_form.addWidget(self.sleep_source)
+        sleep_form.addWidget(QLabel("after"))
+        sleep_form.addWidget(self.sleep_timeout_seconds)
+        sleep_form.addWidget(self.sleep_action)
+        sleep_form.addWidget(apply_sleep)
+        sleep_form.addStretch(1)
+        power_layout.addLayout(sleep_form)
+
+        action_row = QHBoxLayout()
+        suspend = QPushButton("Suspend now")
+        hibernate = QPushButton("Hibernate now")
+        poweroff = QPushButton("Power off now")
+        suspend.clicked.connect(lambda: self.run_power_action("suspend"))
+        hibernate.clicked.connect(lambda: self.run_power_action("hibernate"))
+        poweroff.clicked.connect(lambda: self.run_power_action("poweroff"))
+        self.poweroff_delay_minutes = QSpinBox()
+        self.poweroff_delay_minutes.setRange(1, 24 * 60)
+        self.poweroff_delay_minutes.setValue(30)
+        self.poweroff_delay_minutes.setSuffix(" min")
+        schedule_poweroff = QPushButton("Schedule power off")
+        cancel_poweroff = QPushButton("Cancel scheduled power off")
+        schedule_poweroff.clicked.connect(self.schedule_poweroff)
+        cancel_poweroff.clicked.connect(self.cancel_poweroff)
+        action_row.addWidget(suspend)
+        action_row.addWidget(hibernate)
+        action_row.addWidget(poweroff)
+        action_row.addWidget(QLabel("Delay"))
+        action_row.addWidget(self.poweroff_delay_minutes)
+        action_row.addWidget(schedule_poweroff)
+        action_row.addWidget(cancel_poweroff)
+        action_row.addStretch(1)
+        power_layout.addLayout(action_row)
+        layout.addWidget(power_group)
+
+        self.system_controls_output = QPlainTextEdit()
+        self.system_controls_output.setReadOnly(True)
+        layout.addWidget(self.system_controls_output)
+        return widget
+
     def refresh_all(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
         if not self.db_available:
             self._try_restore_database()
@@ -703,6 +850,7 @@ class MainWindow(QMainWindow):
         self.refresh_chart()
         self.refresh_events()
         self.refresh_thresholds()
+        self.refresh_system_controls()
 
     def refresh_sessions(
         self,
@@ -982,6 +1130,242 @@ class MainWindow(QMainWindow):
                 self.thresholds_table.setItem(row_idx, col, item)
         self.thresholds_table.resizeColumnsToContents()
 
+    def refresh_system_controls(self) -> None:
+        if not hasattr(self, "system_backend_label"):
+            return
+        status = self.system_controls.backend_status()
+        self.system_backend_label.setText(
+            "Backends: "
+            f"xset={'yes' if status.xset_available else 'no'}, "
+            f"gsettings={'yes' if status.gsettings_available else 'no'}, "
+            f"systemctl={'yes' if status.systemctl_available else 'no'}, "
+            f"shutdown={'yes' if status.shutdown_available else 'no'}"
+        )
+
+        backlights = self.system_controls.list_backlights()
+        self._backlight_devices = {device.name: device for device in backlights}
+        self._sync_device_combo(self.backlight_combo, [(device.name, device.name) for device in backlights])
+        self._populate_backlight_table(backlights)
+        self._select_backlight()
+
+        leds = self.system_controls.list_leds()
+        self._led_devices = {device.name: device for device in leds}
+        self._sync_device_combo(self.led_combo, [(device.name, device.name) for device in leds])
+        self._populate_led_table(leds)
+        self._select_led()
+
+        radios = self.system_controls.list_rfkill()
+        self._rfkill_devices = {device.name: device for device in radios}
+        self._sync_device_combo(
+            self.rfkill_combo,
+            [(device.name, f"{device.kind}: {device.label} ({device.name})") for device in radios],
+        )
+        self._populate_rfkill_table(radios)
+
+    def _populate_backlight_table(self, devices: list[Any]) -> None:
+        self.backlight_table.setRowCount(len(devices))
+        for row, device in enumerate(devices):
+            values = [
+                device.name,
+                str(device.brightness),
+                str(device.max_brightness),
+                f"{device.percent:.0f}%",
+                "yes" if device.writable else "no",
+            ]
+            self._set_table_row(self.backlight_table, row, values)
+        self.backlight_table.resizeColumnsToContents()
+
+    def _populate_led_table(self, devices: list[Any]) -> None:
+        self.led_table.setRowCount(len(devices))
+        for row, device in enumerate(devices):
+            values = [
+                device.name,
+                str(device.brightness),
+                str(device.max_brightness),
+                device.trigger or "",
+                "yes" if device.writable else "no",
+            ]
+            self._set_table_row(self.led_table, row, values)
+        self.led_table.resizeColumnsToContents()
+
+    def _populate_rfkill_table(self, devices: list[Any]) -> None:
+        self.rfkill_table.setRowCount(len(devices))
+        for row, device in enumerate(devices):
+            values = [
+                device.name,
+                device.kind,
+                device.label,
+                self._format_optional_bool(device.soft_blocked),
+                self._format_optional_bool(device.hard_blocked),
+                self._format_optional_bool(device.enabled),
+            ]
+            self._set_table_row(self.rfkill_table, row, values)
+        self.rfkill_table.resizeColumnsToContents()
+
+    @staticmethod
+    def _set_table_row(table: QTableWidget, row: int, values: list[str]) -> None:
+        for col, value in enumerate(values):
+            table.setItem(row, col, QTableWidgetItem(value))
+
+    @staticmethod
+    def _format_optional_bool(value: bool | None) -> str:
+        if value is None:
+            return "unknown"
+        return "yes" if value else "no"
+
+    @staticmethod
+    def _sync_device_combo(combo: QComboBox, items: list[tuple[str, str]]) -> None:
+        current = combo.currentData()
+        same_order = combo.count() == len(items) and all(
+            str(combo.itemData(index)) == key for index, (key, _label) in enumerate(items)
+        )
+        if same_order:
+            for index, (_key, label) in enumerate(items):
+                if combo.itemText(index) != label:
+                    combo.setItemText(index, label)
+            return
+        was_blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            for key, label in items:
+                combo.addItem(label, key)
+            if current is not None:
+                index = combo.findData(current)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(was_blocked)
+
+    def _select_backlight(self, _index: int | None = None) -> None:
+        if not hasattr(self, "_backlight_devices"):
+            return
+        name = self.backlight_combo.currentData()
+        device = self._backlight_devices.get(str(name)) if name is not None else None
+        if device is None:
+            self.backlight_slider.setEnabled(False)
+            self.backlight_value.setEnabled(False)
+            return
+        value = int(round(device.percent))
+        self.backlight_slider.setEnabled(device.writable)
+        self.backlight_value.setEnabled(device.writable)
+        self.backlight_slider.setValue(value)
+        self.backlight_value.setValue(value)
+
+    def _select_led(self, _index: int | None = None) -> None:
+        if not hasattr(self, "_led_devices"):
+            return
+        name = self.led_combo.currentData()
+        device = self._led_devices.get(str(name)) if name is not None else None
+        if device is None:
+            self.led_value.setEnabled(False)
+            return
+        self.led_value.setEnabled(device.writable)
+        self.led_value.setRange(0, max(0, int(device.max_brightness)))
+        self.led_value.setValue(int(device.brightness))
+
+    def apply_backlight(self) -> None:
+        name = self.backlight_combo.currentData()
+        if name is None:
+            QMessageBox.information(self, "Display brightness", "No display backlight was detected.")
+            return
+        try:
+            device = self.system_controls.set_backlight_percent(str(name), self.backlight_value.value())
+        except (OSError, ValueError) as exc:
+            self._append_system_control_message(f"Display brightness failed: {exc}")
+            QMessageBox.warning(self, "Display brightness", str(exc))
+            return
+        self._append_system_control_message(f"{device.name}: brightness set to {device.percent:.0f}%.")
+        self.refresh_system_controls()
+
+    def apply_led(self) -> None:
+        name = self.led_combo.currentData()
+        if name is None:
+            QMessageBox.information(self, "ThinkPad lights", "No LED devices were detected.")
+            return
+        try:
+            device = self.system_controls.set_led_brightness(str(name), self.led_value.value())
+        except (OSError, ValueError) as exc:
+            self._append_system_control_message(f"LED control failed: {exc}")
+            QMessageBox.warning(self, "ThinkPad lights", str(exc))
+            return
+        self._append_system_control_message(f"{device.name}: brightness set to {device.brightness}/{device.max_brightness}.")
+        self.refresh_system_controls()
+
+    def apply_rfkill(self, enabled: bool) -> None:
+        name = self.rfkill_combo.currentData()
+        if name is None:
+            QMessageBox.information(self, "Wireless radios", "No rfkill radio devices were detected.")
+            return
+        try:
+            device = self.system_controls.set_rfkill_enabled(str(name), enabled)
+        except (OSError, ValueError) as exc:
+            self._append_system_control_message(f"Radio control failed: {exc}")
+            QMessageBox.warning(self, "Wireless radios", str(exc))
+            return
+        state = "enabled" if device.enabled else "disabled"
+        self._append_system_control_message(f"{device.kind} {device.label}: {state}.")
+        self.refresh_system_controls()
+
+    def apply_screen_timeout(self) -> None:
+        try:
+            results = self.system_controls.set_screen_idle_timeout(self.screen_timeout_seconds.value())
+        except (RuntimeError, OSError) as exc:
+            self._append_system_control_message(f"Screen timeout failed: {exc}")
+            QMessageBox.warning(self, "Screen timeout", str(exc))
+            return
+        self._append_system_control_results(results)
+
+    def apply_sleep_timeout(self) -> None:
+        try:
+            result = self.system_controls.set_sleep_timeout(
+                self.sleep_source.currentText(),
+                self.sleep_timeout_seconds.value(),
+                self.sleep_action.currentText(),
+            )
+        except (OSError, ValueError) as exc:
+            self._append_system_control_message(f"Inactivity action failed: {exc}")
+            QMessageBox.warning(self, "Inactivity action", str(exc))
+            return
+        self._append_system_control_results([result])
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Inactivity action", result.combined_output())
+
+    def run_power_action(self, action: str) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Power action",
+            f"This will run 'systemctl {action}' now. Continue?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        result = self.system_controls.run_power_action(action)
+        self._append_system_control_results([result])
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Power action", result.combined_output())
+
+    def schedule_poweroff(self) -> None:
+        result = self.system_controls.schedule_poweroff(self.poweroff_delay_minutes.value())
+        self._append_system_control_results([result])
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Schedule power off", result.combined_output())
+
+    def cancel_poweroff(self) -> None:
+        result = self.system_controls.cancel_scheduled_poweroff()
+        self._append_system_control_results([result])
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Cancel power off", result.combined_output())
+
+    def _append_system_control_results(self, results: list[CommandResult]) -> None:
+        for result in results:
+            command = " ".join(result.command)
+            self._append_system_control_message(
+                f"[{result.title}] exit {result.returncode}\n$ {command}\n{result.combined_output()}"
+            )
+
+    def _append_system_control_message(self, message: str) -> None:
+        if hasattr(self, "system_controls_output"):
+            self.system_controls_output.appendPlainText(message)
+
     @staticmethod
     def _format_threshold_pair(start: int | None, stop: int | None) -> str:
         if start is None or stop is None:
@@ -1003,7 +1387,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export CSV", "Select a session before exporting.")
             return
 
-        default_path = Path.home() / f"battery-auditor-{session_id}.csv"
+        default_path = Path.home() / f"thinkpad-energy-manager-{session_id}.csv"
         filename, _selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export session CSV",
@@ -1376,8 +1760,8 @@ class MainWindow(QMainWindow):
             "Commands that would be run:\n"
             f"{commands}\n\n"
             "Run this from a terminal after reviewing the commands:\n"
-            "battery-auditor thresholds restore --dry-run\n"
-            "battery-auditor thresholds restore --yes"
+            "thinkpad-energy-manager thresholds restore --dry-run\n"
+            "thinkpad-energy-manager thresholds restore --yes"
         )
 
     def recalibrate_battery(self) -> None:

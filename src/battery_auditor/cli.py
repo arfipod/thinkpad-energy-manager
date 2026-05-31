@@ -68,8 +68,8 @@ from battery_auditor.core.tlp import TlpClient
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="battery-auditor",
-        description="Low-impact Linux battery recorder and diagnostics toolkit.",
+        prog="thinkpad-energy-manager",
+        description="ThinkPad energy, battery, lighting, radio, and power-management toolkit.",
     )
     parser.add_argument("--config", type=Path, action="append", help="Extra TOML config path.")
     parser.add_argument("--db", type=Path, help="SQLite database path.")

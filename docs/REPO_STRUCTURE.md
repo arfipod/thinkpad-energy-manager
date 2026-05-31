@@ -1,7 +1,7 @@
 # Repository structure
 
 ```text
-battery-auditor/
+thinkpad-energy-manager/
 |-- src/battery_auditor/
 |  |-- cli.py                    # Main CLI
 |  |-- config.py                 # TOML configuration and defaults

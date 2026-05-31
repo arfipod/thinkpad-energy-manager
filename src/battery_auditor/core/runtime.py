@@ -180,7 +180,7 @@ def read_lock_info(cfg: AuditorConfig) -> CollectorLockInfo:
 
 def write_lock_payload(lock_file: Any) -> None:
     payload = {
-        "app": "battery-auditor",
+        "app": "thinkpad-energy-manager",
         "role": "collector",
         "pid": os.getpid(),
         "started_wall": time.time(),
@@ -224,15 +224,26 @@ def pid_exists(pid: int) -> bool:
 def process_looks_like_collector(cmdline: list[str], comm: str | None = None) -> tuple[bool, str]:
     lowered = [item.lower() for item in cmdline]
     has_collect = any(item == "collect" for item in lowered)
-    has_battery_auditor = any("battery-auditor" in item or "battery_auditor" in item for item in lowered)
-    if has_collect and has_battery_auditor:
+    has_energy_manager = any(
+        "thinkpad-energy-manager" in item or "battery-auditor" in item or "battery_auditor" in item
+        for item in lowered
+    )
+    if has_collect and has_energy_manager:
         return True, "cmdline_matches_collector"
-    if comm and ("battery-auditor" in comm.lower() or "battery_auditor" in comm.lower()) and has_collect:
+    if (
+        comm
+        and (
+            "thinkpad-energy-manager" in comm.lower()
+            or "battery-auditor" in comm.lower()
+            or "battery_auditor" in comm.lower()
+        )
+        and has_collect
+    ):
         return True, "comm_matches_collector"
     if not cmdline:
         return False, "cmdline_unavailable"
-    if not has_battery_auditor:
-        return False, "cmdline_missing_battery_auditor"
+    if not has_energy_manager:
+        return False, "cmdline_missing_energy_manager"
     return False, "cmdline_missing_collect"
 
 
@@ -386,7 +397,7 @@ def collect_runtime_status(cfg: AuditorConfig, db: Any | None = None) -> Collect
     if lock.parse_error:
         warnings.append(f"Collector lock could not be parsed: {lock.parse_error}")
     if process and process.exists and not process.collector_like:
-        warnings.append(f"Lock PID does not look like a Battery Auditor collector: {process.verify_reason}")
+        warnings.append(f"Lock PID does not look like a ThinkPad Energy Manager collector: {process.verify_reason}")
 
     state = _derive_state(
         lock=lock,
@@ -436,7 +447,7 @@ def stop_collector(cfg: AuditorConfig, *, force: bool = False, timeout_seconds: 
             ok=False,
             pid=pid,
             unsafe=True,
-            message=f"Refusing to signal PID {pid}: process does not look like a Battery Auditor collector ({reason}).",
+            message=f"Refusing to signal PID {pid}: process does not look like a ThinkPad Energy Manager collector ({reason}).",
         )
 
     sig = signal.SIGKILL if force else signal.SIGTERM

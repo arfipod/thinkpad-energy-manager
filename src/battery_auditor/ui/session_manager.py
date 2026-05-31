@@ -41,7 +41,7 @@ try:
 except ImportError as exc:  # pragma: no cover - depends on optional UI extra
     raise SystemExit(
         "PySide6 is required for the Qt UI. Install with:\n"
-        "  python -m pip install 'battery-auditor[ui]'"
+        "  python -m pip install 'thinkpad-energy-manager[ui]'"
     ) from exc
 
 
@@ -181,7 +181,7 @@ class SessionManager(QWidget):
         suffix = ".csv" if fmt == "csv" else ".json"
         exporter = export_session_csv if fmt == "csv" else export_session_json
         if len(selected) == 1:
-            default_path = Path.home() / f"battery-auditor-{_safe_filename(selected[0])}{suffix}"
+            default_path = Path.home() / f"thinkpad-energy-manager-{_safe_filename(selected[0])}{suffix}"
             filename, _selected_filter = QFileDialog.getSaveFileName(
                 self,
                 f"Export {fmt.upper()}",
@@ -207,7 +207,7 @@ class SessionManager(QWidget):
         output_dir = Path(directory).expanduser()
         try:
             for session_id in selected:
-                exporter(self.db, session_id, output_dir / f"battery-auditor-{_safe_filename(session_id)}{suffix}")
+                exporter(self.db, session_id, output_dir / f"thinkpad-energy-manager-{_safe_filename(session_id)}{suffix}")
         except (OSError, sqlite3.DatabaseError) as exc:
             QMessageBox.warning(self, "Export", f"Export failed:\n{exc}")
             return

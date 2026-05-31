@@ -1,6 +1,6 @@
-# Battery Auditor
+# ThinkPad Energy Manager
 
-Battery Auditor is a local Linux tool that records, analyzes, and charts real battery behavior, especially on laptops with multiple batteries such as Lenovo ThinkPads with Power Bridge.
+ThinkPad Energy Manager is a local Linux tool that records, analyzes, and charts real battery behavior, especially on laptops with multiple batteries such as Lenovo ThinkPads with Power Bridge.
 
 Its main goal is not to save battery power, but to **diagnose batteries without adding much measurement noise**.
 
@@ -11,6 +11,7 @@ Its main goal is not to save battery power, but to **diagnose batteries without 
 - Black-box mode for tests where the laptop may shut down because the battery runs out.
 - Event detection: AC changes, active battery changes, percentage jumps, sudden voltage sag, low/critical battery, and interrupted sessions.
 - Optional Python + Qt/PySide6 UI with interactive pyqtgraph charts.
+- ThinkPad controls tab for display brightness, keyboard and chassis LEDs, rfkill radios, screen idle timeout, suspend/hibernate/power-off actions, and delayed shutdown.
 - Manual TLP wrapper: `tlp-stat`, `setcharge`, `recalibrate`.
 - User-level systemd services.
 - CSV/JSON export for external analysis.
@@ -50,128 +51,128 @@ python -m pip install -e .
 Read a single snapshot:
 
 ```bash
-battery-auditor once
+thinkpad-energy-manager once
 ```
 
 Record a diagnostic session:
 
 ```bash
-battery-auditor collect --mode diagnostic --name normal-discharge
+thinkpad-energy-manager collect --mode diagnostic --name normal-discharge
 ```
 
 Show collector status:
 
 ```bash
-battery-auditor status
-battery-auditor status --json
+thinkpad-energy-manager status
+thinkpad-energy-manager status --json
 ```
 
 Pause, resume, or stop the collector:
 
 ```bash
-battery-auditor pause
-battery-auditor resume
-battery-auditor stop
+thinkpad-energy-manager pause
+thinkpad-energy-manager resume
+thinkpad-energy-manager stop
 ```
 
 Use force stop only when normal stop cannot work:
 
 ```bash
-battery-auditor stop --force
+thinkpad-energy-manager stop --force
 ```
 
 Record in black-box mode:
 
 ```bash
-battery-auditor collect --mode blackbox --name discharge-to-shutdown
+thinkpad-energy-manager collect --mode blackbox --name discharge-to-shutdown
 ```
 
 List sessions:
 
 ```bash
-battery-auditor sessions
+thinkpad-energy-manager sessions
 ```
 
 Rename or annotate a session:
 
 ```bash
-battery-auditor rename-session <session_id> --name "post-recalibration run"
-battery-auditor note-session <session_id> --notes "BAT1 drained faster after 40%."
+thinkpad-energy-manager rename-session <session_id> --name "post-recalibration run"
+thinkpad-energy-manager note-session <session_id> --notes "BAT1 drained faster after 40%."
 ```
 
 Merge sessions into a synthetic session:
 
 ```bash
-battery-auditor merge-sessions <id1> <id2> --name "merged-test"
+thinkpad-energy-manager merge-sessions <id1> <id2> --name "merged-test"
 ```
 
 Delete a session and its dependent rows:
 
 ```bash
-battery-auditor delete-session <session_id>
+thinkpad-energy-manager delete-session <session_id>
 ```
 
 Analyze the latest session:
 
 ```bash
-battery-auditor analyze
+thinkpad-energy-manager analyze
 ```
 
 Show semantic charge/discharge phases:
 
 ```bash
-battery-auditor analyze phases
-battery-auditor analyze --phases <session_id>
+thinkpad-energy-manager analyze phases
+thinkpad-energy-manager analyze --phases <session_id>
 ```
 
 Show physically impossible or suspicious fuel-gauge jumps:
 
 ```bash
-battery-auditor analyze jumps
-battery-auditor analyze --jumps <session_id>
+thinkpad-energy-manager analyze jumps
+thinkpad-energy-manager analyze --jumps <session_id>
 ```
 
 Show reported full-capacity relearning:
 
 ```bash
-battery-auditor analyze relearn
-battery-auditor analyze --relearn <session_id>
+thinkpad-energy-manager analyze relearn
+thinkpad-energy-manager analyze --relearn <session_id>
 ```
 
 Show configured vs sysfs charge threshold readback:
 
 ```bash
-battery-auditor thresholds status
-battery-auditor thresholds status <session_id>
-battery-auditor thresholds restore --dry-run
-battery-auditor thresholds restore BAT0 --yes
+thinkpad-energy-manager thresholds status
+thinkpad-energy-manager thresholds status <session_id>
+thinkpad-energy-manager thresholds restore --dry-run
+thinkpad-energy-manager thresholds restore BAT0 --yes
 ```
 
 Estimate effective charge state and runtime:
 
 ```bash
-battery-auditor estimate
-battery-auditor estimate --session <session_id>
-battery-auditor estimate --json
+thinkpad-energy-manager estimate
+thinkpad-energy-manager estimate --session <session_id>
+thinkpad-energy-manager estimate --json
 ```
 
 Export phases:
 
 ```bash
-battery-auditor analyze --phases <session_id> --format csv --out phases.csv
-battery-auditor analyze --phases <session_id> --format json --out phases.json
+thinkpad-energy-manager analyze --phases <session_id> --format csv --out phases.csv
+thinkpad-energy-manager analyze --phases <session_id> --format json --out phases.json
 ```
 
 Export to CSV:
 
 ```bash
-battery-auditor export --format csv --out discharge.csv
+thinkpad-energy-manager export --format csv --out discharge.csv
 ```
 
 Open the UI:
 
 ```bash
-battery-auditor-qt
+thinkpad-energy-manager-qt
 ```
 
 ## Qt UI screenshots
@@ -208,13 +209,13 @@ Events and TLP tools:
 
 ## Collector lifecycle
 
-Battery Auditor keeps collector runtime state under the configured data directory:
+ThinkPad Energy Manager keeps collector runtime state under the configured data directory:
 
 - `collector.lock` records the active collector PID and is protected with an advisory lock;
 - `heartbeats/*.json` records lightweight current-session state, including paused state, last seq, and heartbeat time;
 - `collector.control.json` is the low-cost pause/resume control file checked by the collector between samples.
 
-`battery-auditor status` combines the lock, PID liveness, heartbeat files, and open SQLite sessions. It reports `RUNNING`, `PAUSED`, `STOPPED`, `STALE`, or `UNKNOWN`.
+`thinkpad-energy-manager status` combines the lock, PID liveness, heartbeat files, and open SQLite sessions. It reports `RUNNING`, `PAUSED`, `STOPPED`, `STALE`, or `UNKNOWN`.
 
 The Qt Recording tab uses the same CLI/runtime layer as the terminal. It can detect and control collectors started by CLI, systemd, or a previous UI instance. When the UI starts a collector, it starts a detached CLI process and writes output to `collector-ui.log` in the data directory. The collector keeps running after the Qt window closes.
 
@@ -227,7 +228,7 @@ Delete, merge, recover, and repair operations refuse to run while an active or a
 Black-box mode is designed to bracket the moment of battery-related shutdown:
 
 ```bash
-battery-auditor collect --mode blackbox --name final-test
+thinkpad-energy-manager collect --mode blackbox --name final-test
 ```
 
 In this mode:
@@ -241,13 +242,13 @@ In this mode:
 After rebooting:
 
 ```bash
-battery-auditor recover
-battery-auditor analyze
+thinkpad-energy-manager recover
+thinkpad-energy-manager analyze
 ```
 
 The exact shutdown instant cannot be measured after the machine loses power, but it can be bracketed by the last persisted heartbeat/sample and the configured interval.
 
-Normal `battery-auditor stop` sends `SIGTERM`, allowing the collector to end the session with `signal_or_user_stop`. Force stop sends `SIGKILL` and can leave the session open because the collector cannot run its clean shutdown path. Use `battery-auditor recover` after reboot or after a force stop if a session remains open.
+Normal `thinkpad-energy-manager stop` sends `SIGTERM`, allowing the collector to end the session with `signal_or_user_stop`. Force stop sends `SIGKILL` and can leave the session open because the collector cannot run its clean shutdown path. Use `thinkpad-energy-manager recover` after reboot or after a force stop if a session remains open.
 
 ## Phase analysis
 
@@ -269,17 +270,17 @@ Example output:
 
 Fuel-gauge percentages are firmware estimates, not direct measurements of real remaining energy. The reported `capacity` value can be smoothed, rounded, stale, or recalibrated by the embedded controller, so it is not always equal to the Wh-based percentage from `energy_now / energy_full`.
 
-`battery-auditor analyze jumps` compares consecutive samples per battery. It checks whether the observed `energy_now` change is plausible for the elapsed time and reported `power_now`, with noise tolerance, and also flags large reported percentage jumps. Low-end jumps below 25% are classified as `LOW_END_GAUGE_JUMP` because this is where bad calibration can hide shutdown risk. These findings lower confidence in later runtime and health conclusions: a battery that drops from about 18% to 6% in one sample may still have usable cells, but its gauge can no longer be trusted as a smooth remaining-energy signal.
+`thinkpad-energy-manager analyze jumps` compares consecutive samples per battery. It checks whether the observed `energy_now` change is plausible for the elapsed time and reported `power_now`, with noise tolerance, and also flags large reported percentage jumps. Low-end jumps below 25% are classified as `LOW_END_GAUGE_JUMP` because this is where bad calibration can hide shutdown risk. These findings lower confidence in later runtime and health conclusions: a battery that drops from about 18% to 6% in one sample may still have usable cells, but its gauge can no longer be trusted as a smooth remaining-energy signal.
 
 ## Capacity relearning
 
-`battery-auditor analyze relearn` scans stored samples for changes in each battery's reported `energy_full` and `energy_full_design`. A change such as 18.28 Wh to 19.91 Wh is reported as `ENERGY_FULL_RELEARN` when it is larger than the configured absolute and relative thresholds.
+`thinkpad-energy-manager analyze relearn` scans stored samples for changes in each battery's reported `energy_full` and `energy_full_design`. A change such as 18.28 Wh to 19.91 Wh is reported as `ENERGY_FULL_RELEARN` when it is larger than the configured absolute and relative thresholds.
 
 This does not mean the battery physically recovered; it means the reported full capacity changed. Embedded controllers can relearn or reconcile the full-capacity estimate after deep discharge, full charge, resume, or other firmware events. Because `computed_percent` is `energy_now / energy_full`, a relearn can change effective percent and ETA models even when the actual stored energy did not suddenly change.
 
 ## Effective battery estimate
 
-`battery-auditor estimate` reports an estimated effective pack percentage and runtime ETA with confidence. It does not claim absolute truth. It combines observed Wh, current learned `energy_full`, routing between packs, low-end gauge jump history, threshold state, and recent discharge-only consumption.
+`thinkpad-energy-manager estimate` reports an estimated effective pack percentage and runtime ETA with confidence. It does not claim absolute truth. It combines observed Wh, current learned `energy_full`, routing between packs, low-end gauge jump history, threshold state, and recent discharge-only consumption.
 
 The terms are:
 
@@ -300,21 +301,21 @@ Install units:
 Enable the normal collector:
 
 ```bash
-systemctl --user enable --now battery-auditor.service
+systemctl --user enable --now thinkpad-energy-manager.service
 ```
 
 Start a black-box session under systemd:
 
 ```bash
-systemctl --user start battery-auditor-blackbox.service
+systemctl --user start thinkpad-energy-manager-blackbox.service
 ```
 
-The UI and `battery-auditor status` detect these systemd-started collectors through the same lock and heartbeat files.
+The UI and `thinkpad-energy-manager status` detect these systemd-started collectors through the same lock and heartbeat files.
 
 Optional sleep/resume hooks:
 
 ```bash
-python -m pip install 'battery-auditor[system]'
+python -m pip install 'thinkpad-energy-manager[system]'
 ```
 
 Then enable the logind monitor in config:
@@ -330,7 +331,7 @@ When available, the collector records `ABOUT_TO_SLEEP` before suspend and `RESUM
 View logs:
 
 ```bash
-journalctl --user -u battery-auditor.service -f
+journalctl --user -u thinkpad-energy-manager.service -f
 ```
 
 Uninstall units:
@@ -341,17 +342,17 @@ Uninstall units:
 
 ## TLP
 
-Battery Auditor does not replace TLP. It complements it.
+ThinkPad Energy Manager does not replace TLP. It complements it.
 
 Useful commands:
 
 ```bash
-battery-auditor tlp-stat battery
-battery-auditor tlp-stat config
-battery-auditor tlp-setcharge BAT0 75 80
-battery-auditor tlp-setcharge BAT1 75 80
-battery-auditor tlp-recalibrate BAT0
-battery-auditor tlp-recalibrate BAT1
+thinkpad-energy-manager tlp-stat battery
+thinkpad-energy-manager tlp-stat config
+thinkpad-energy-manager tlp-setcharge BAT0 75 80
+thinkpad-energy-manager tlp-setcharge BAT1 75 80
+thinkpad-energy-manager tlp-recalibrate BAT0
+thinkpad-energy-manager tlp-recalibrate BAT1
 ```
 
 TLP actions are manual and are not part of the periodic collector, so they do not contaminate measurements.
@@ -360,13 +361,13 @@ TLP actions are manual and are not part of the periodic collector, so they do no
 
 Charge thresholds can be configured in TLP while the live sysfs readback reports something else. On some systems the expected 75/80 thresholds can temporarily appear as 0/100 after firmware, resume, or power-management events. That matters because the battery may charge outside the intended preservation window even though the user-space configuration still looks correct.
 
-`battery-auditor thresholds status` compares configured thresholds with the latest stored sysfs readback from `charge_control_start_threshold` / `charge_control_end_threshold`, falling back to `charge_start_threshold` / `charge_stop_threshold` when needed. It does not run privileged commands. TLP config, UPower, and sysfs can disagree because they observe or manage different layers; the watchdog treats sysfs as the current kernel readback and reports `OK`, `MISMATCH`, or `UNKNOWN`.
+`thinkpad-energy-manager thresholds status` compares configured thresholds with the latest stored sysfs readback from `charge_control_start_threshold` / `charge_control_end_threshold`, falling back to `charge_start_threshold` / `charge_stop_threshold` when needed. It does not run privileged commands. TLP config, UPower, and sysfs can disagree because they observe or manage different layers; the watchdog treats sysfs as the current kernel readback and reports `OK`, `MISMATCH`, or `UNKNOWN`.
 
-Restoring thresholds is optional and explicit because it changes charging behavior. Use `battery-auditor thresholds restore --dry-run` to review the exact `sudo tlp setcharge <start> <stop> BAT*` commands. Run `battery-auditor thresholds restore --yes` or target one battery such as `battery-auditor thresholds restore BAT1 --yes` only after confirming the configured values. Automatic restore after resume or mismatch is disabled by default and must be enabled in config.
+Restoring thresholds is optional and explicit because it changes charging behavior. Use `thinkpad-energy-manager thresholds restore --dry-run` to review the exact `sudo tlp setcharge <start> <stop> BAT*` commands. Run `thinkpad-energy-manager thresholds restore --yes` or target one battery such as `thinkpad-energy-manager thresholds restore BAT1 --yes` only after confirming the configured values. Automatic restore after resume or mismatch is disabled by default and must be enabled in config.
 
 ## Recorded data
 
-For each sample, Battery Auditor stores:
+For each sample, ThinkPad Energy Manager stores:
 
 - timestamps: wall-clock, ISO, monotonic time, and sequence number;
 - power state: AC online state, active battery names, computed total energy, total full/design energy, total power, computed total percentage, and total health percentage;
@@ -384,8 +385,8 @@ See more in [`docs/SCHEMA.md`](docs/SCHEMA.md).
 Copy the example:
 
 ```bash
-mkdir -p ~/.config/battery-auditor
-cp examples/config.toml ~/.config/battery-auditor/config.toml
+mkdir -p ~/.config/thinkpad-energy-manager
+cp examples/config.toml ~/.config/thinkpad-energy-manager/config.toml
 ```
 
 Pay special attention to:
@@ -422,16 +423,16 @@ ruff check .
 ## Manual lifecycle validation
 
 ```bash
-battery-auditor collect --mode diagnostic --name cli-test
-battery-auditor status --json
-battery-auditor pause
-battery-auditor status
-battery-auditor resume
-battery-auditor stop
-battery-auditor sessions
-battery-auditor-qt
-battery-auditor merge-sessions <id1> <id2> --name "merged-test"
-battery-auditor export <merged_id> --format csv --out merged.csv
+thinkpad-energy-manager collect --mode diagnostic --name cli-test
+thinkpad-energy-manager status --json
+thinkpad-energy-manager pause
+thinkpad-energy-manager status
+thinkpad-energy-manager resume
+thinkpad-energy-manager stop
+thinkpad-energy-manager sessions
+thinkpad-energy-manager-qt
+thinkpad-energy-manager merge-sessions <id1> <id2> --name "merged-test"
+thinkpad-energy-manager export <merged_id> --format csv --out merged.csv
 ```
 
 ## Project status

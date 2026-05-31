@@ -1,5 +1,5 @@
 [Unit]
-Description=ThinkPad Energy Manager black-box collector (legacy alias)
+Description=ThinkPad Energy Manager black-box collector
 Documentation=https://github.com/arfipod/thinkpad-energy-manager
 After=graphical-session.target
 

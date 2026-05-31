@@ -1,5 +1,5 @@
 [Unit]
-Description=ThinkPad Energy Manager low-impact collector (legacy alias)
+Description=ThinkPad Energy Manager low-impact collector
 Documentation=https://github.com/arfipod/thinkpad-energy-manager
 After=graphical-session.target
 

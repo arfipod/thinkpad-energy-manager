@@ -89,7 +89,7 @@ def _disk_worker(stop_event: mp.synchronize.Event, mib_per_second: float, disk_d
     block = os.urandom(1024 * 1024)
     target_dir = disk_dir.expanduser() if disk_dir is not None else Path(tempfile.gettempdir())
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"battery-auditor-load-{os.getpid()}.bin"
+    target = target_dir / f"thinkpad-energy-manager-load-{os.getpid()}.bin"
     interval = 1.0 / max(0.1, mib_per_second)
     try:
         with target.open("wb") as fh:

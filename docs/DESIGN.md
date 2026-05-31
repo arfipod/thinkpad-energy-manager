@@ -11,7 +11,7 @@
 ## Architecture
 
 ```text
-battery-auditor
+thinkpad-energy-manager
 |-- collector
 |  |-- reads /sys/class/power_supply
 |  |-- generates events
@@ -59,7 +59,7 @@ SQLite WAL allows writing samples without blocking UI reads. Normal mode uses `s
 
 ## Per-battery measurement
 
-Battery Auditor does not rely only on the global percentage. Each battery has:
+ThinkPad Energy Manager does not rely only on the global percentage. Each battery has:
 
 - kernel-reported percentage;
 - computed percentage: `energy_now / energy_full * 100`;
@@ -101,7 +101,7 @@ Threshold restore is a separate, opt-in action. Manual restore and the optional 
 
 ## Sleep monitor
 
-The optional sleep monitor listens for logind `PrepareForSleep(bool)` over D-Bus when `battery-auditor[system]` is installed and `[sleep_monitor]` is enabled. It is event-driven; it does not poll. D-Bus callbacks enqueue lightweight notifications, and the collector thread performs the actual SQLite writes.
+The optional sleep monitor listens for logind `PrepareForSleep(bool)` over D-Bus when `thinkpad-energy-manager[system]` is installed and `[sleep_monitor]` is enabled. It is event-driven; it does not poll. D-Bus callbacks enqueue lightweight notifications, and the collector thread performs the actual SQLite writes.
 
 `PrepareForSleep(true)` becomes `ABOUT_TO_SLEEP`. `PrepareForSleep(false)` becomes `RESUMED`, wakes the collector loop, and requests one immediate battery sample with `RESUME_SAMPLE_TAKEN`. If the monitor cannot start, the collector records `SLEEP_MONITOR_UNAVAILABLE` and continues. Wall-time/monotonic gap classification remains the fallback and source of truth when hooks are unavailable or missed.
 

@@ -10,8 +10,8 @@ sudo apt install -y python3 python3-venv python3-pip tlp libxcb-cursor0
 Clone the repository and create the environment:
 
 ```bash
-git clone https://github.com/arfipod/battery-auditor.git
-cd battery-auditor
+git clone https://github.com/arfipod/thinkpad-energy-manager.git
+cd thinkpad-energy-manager
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -21,7 +21,7 @@ python -m pip install -e '.[ui]'
 Check that it can read the batteries:
 
 ```bash
-battery-auditor once
+thinkpad-energy-manager once
 ```
 
 ## CLI only, no UI
@@ -62,20 +62,20 @@ Or install PySide6 and pyqtgraph with distribution packages if you have them ava
 
 ```bash
 ./scripts/install-user-service.sh
-systemctl --user enable --now battery-auditor.service
+systemctl --user enable --now thinkpad-energy-manager.service
 ```
 
-The service uses `%h/.local/bin/battery-auditor`. If you install inside a project virtualenv instead of using `pip install --user`, adjust `ExecStart` in:
+The service uses `%h/.local/bin/thinkpad-energy-manager`. If you install inside a project virtualenv instead of using `pip install --user`, adjust `ExecStart` in:
 
 ```text
-~/.config/systemd/user/battery-auditor.service
+~/.config/systemd/user/thinkpad-energy-manager.service
 ```
 
 Then:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user restart battery-auditor.service
+systemctl --user restart thinkpad-energy-manager.service
 ```
 
-The sleep monitor is designed to work from the user service when the user bus can connect to system logind. Some distributions or hardening profiles may require a system-level service for the most reliable sleep hooks; Battery Auditor does not install or require one by default.
+The sleep monitor is designed to work from the user service when the user bus can connect to system logind. Some distributions or hardening profiles may require a system-level service for the most reliable sleep hooks; ThinkPad Energy Manager does not install or require one by default.

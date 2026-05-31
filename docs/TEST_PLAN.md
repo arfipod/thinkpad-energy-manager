@@ -17,11 +17,11 @@ Cases:
 ## Smoke test on real hardware
 
 ```bash
-battery-auditor once
-battery-auditor collect --mode diagnostic --duration 10 --name smoke-test
-battery-auditor sessions
-battery-auditor analyze
-battery-auditor export --format csv --out smoke.csv
+thinkpad-energy-manager once
+thinkpad-energy-manager collect --mode diagnostic --duration 10 --name smoke-test
+thinkpad-energy-manager sessions
+thinkpad-energy-manager analyze
+thinkpad-energy-manager export --format csv --out smoke.csv
 ```
 
 ## Controlled black-box test
@@ -30,13 +30,13 @@ battery-auditor export --format csv --out smoke.csv
 2. Run:
 
 ```bash
-battery-auditor collect --mode blackbox --name blackbox-smoke --duration 60
+thinkpad-energy-manager collect --mode blackbox --name blackbox-smoke --duration 60
 ```
 
 3. Confirm:
 
 ```bash
-battery-auditor analyze
+thinkpad-energy-manager analyze
 ```
 
 ## Recovery test
@@ -44,11 +44,11 @@ battery-auditor analyze
 Simulate a collector interruption:
 
 ```bash
-battery-auditor collect --mode diagnostic --name recover-test
+thinkpad-energy-manager collect --mode diagnostic --name recover-test
 # In another terminal:
 pkill -f 'battery_auditor.cli.*collect'
-battery-auditor recover
-battery-auditor analyze
+thinkpad-energy-manager recover
+thinkpad-energy-manager analyze
 ```
 
 `PROBABLE_POWER_LOSS` or an interrupted session should appear.

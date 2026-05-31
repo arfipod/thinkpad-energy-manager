@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-APP_NAME = "battery-auditor"
+APP_NAME = "thinkpad-energy-manager"
+LEGACY_APP_NAME = "battery-auditor"
 
 
 def _default_state_dir() -> Path:
@@ -22,6 +23,13 @@ def _default_config_dir() -> Path:
     if xdg_config:
         return Path(xdg_config) / APP_NAME
     return Path.home() / ".config" / APP_NAME
+
+
+def _legacy_config_dir() -> Path:
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config:
+        return Path(xdg_config) / LEGACY_APP_NAME
+    return Path.home() / ".config" / LEGACY_APP_NAME
 
 
 @dataclass(slots=True)
@@ -90,7 +98,7 @@ class AuditorConfig:
     def resolved_db_path(self) -> Path:
         if self.db_path is not None:
             return self.db_path.expanduser()
-        return self.data_dir.expanduser() / "battery-auditor.sqlite3"
+        return self.data_dir.expanduser() / "thinkpad-energy-manager.sqlite3"
 
     def heartbeat_dir(self) -> Path:
         return self.data_dir.expanduser() / "heartbeats"
@@ -111,8 +119,10 @@ class AuditorConfig:
 
 
 DEFAULT_CONFIG_PATHS = [
-    Path("/etc/battery-auditor/config.toml"),
+    Path("/etc/thinkpad-energy-manager/config.toml"),
     _default_config_dir() / "config.toml",
+    Path(f"/etc/{LEGACY_APP_NAME}/config.toml"),
+    _legacy_config_dir() / "config.toml",
 ]
 
 

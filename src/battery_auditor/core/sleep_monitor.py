@@ -62,7 +62,7 @@ class LogindSleepMonitor(SleepMonitor):
         except ImportError as exc:
             return SleepMonitorUnavailable(reason=f"dbus-next is not installed: {exc}")
 
-        self._thread = threading.Thread(target=self._run_thread, name="battery-auditor-sleep-monitor", daemon=True)
+        self._thread = threading.Thread(target=self._run_thread, name="thinkpad-energy-manager-sleep-monitor", daemon=True)
         self._thread.start()
         self._started.wait(timeout=2.0)
         return self._unavailable

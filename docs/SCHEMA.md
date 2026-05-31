@@ -3,7 +3,7 @@
 The default database is located at:
 
 ```text
-~/.local/state/battery-auditor/battery-auditor.sqlite3
+~/.local/state/thinkpad-energy-manager/thinkpad-energy-manager.sqlite3
 ```
 
 ## `sessions`
@@ -125,7 +125,7 @@ Energy/power/voltage sysfs paths usually come in micro-units:
 - `power_now`: micro-watt (`uW`)
 - `voltage_now`: microvolt (`uV`)
 
-Battery Auditor preserves these raw units and calculates Wh/W/V views in the CLI/UI when needed.
+ThinkPad Energy Manager preserves these raw units and calculates Wh/W/V views in the CLI/UI when needed.
 
 Additional units and encodings:
 
