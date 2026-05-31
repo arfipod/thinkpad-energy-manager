@@ -27,6 +27,12 @@ from battery_auditor.core.tlp import TlpClient
 from battery_auditor.ui.session_manager import SessionManager
 
 BLACKBOX_SERVICE = "battery-auditor-blackbox.service"
+PERSISTENT_DATABASE_ERROR_MARKERS = (
+    "database disk image is malformed",
+    "file is not a database",
+    "invalid page number",
+    "unsupported database schema",
+)
 
 try:
     import pyqtgraph as pg  # type: ignore[import-untyped]
@@ -365,6 +371,7 @@ class MainWindow(QMainWindow):
         self.db = BatteryDatabase(cfg.resolved_db_path(), cfg, read_only=True)
         self.db_available = True
         self.db_error: str | None = None
+        self._database_recovery_disabled = False
         try:
             self.db.init_schema()
             integrity = self.db.check_integrity(quick=True)
@@ -587,7 +594,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(refresh)
         controls.addWidget(export_csv)
         self.chart = BatteryChart()
+        self.chart_status_label = QLabel("")
         layout.addLayout(controls)
+        layout.addWidget(self.chart_status_label)
         layout.addWidget(self.chart)
         return widget
 
@@ -672,8 +681,6 @@ class MainWindow(QMainWindow):
     ) -> None:
         if not self.db_available:
             self._show_database_error()
-            if hasattr(self, "session_combo"):
-                self.session_combo.clear()
             return
         current = self.session_combo.currentData() if hasattr(self, "session_combo") else None
         running_index: int | None = None
@@ -689,7 +696,6 @@ class MainWindow(QMainWindow):
                     running_index = len(items) - 1
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
-            self.session_combo.clear()
             self._show_database_error()
             return
         was_blocked = self.session_combo.blockSignals(True)
@@ -760,7 +766,9 @@ class MainWindow(QMainWindow):
 
     def refresh_chart(self, _checked: bool = False, *, force: bool = False) -> None:
         if not self.db_available:
-            self.chart.set_data("Database unavailable", "", [])
+            self._show_database_error()
+            if not self.chart.series and not self.chart.events:
+                self.chart.set_data("Database unavailable", "", [])
             return
         session_id = self.session_combo.currentData()
         if not session_id:
@@ -783,8 +791,9 @@ class MainWindow(QMainWindow):
             events = self.db.fetch_events(session_text, limit=1000)
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
-            self.chart.set_data("Database unavailable", metric, [])
             self._show_database_error()
+            if not self.chart.series and not self.chart.events:
+                self.chart.set_data("Database unavailable", metric, [])
             return
         if not rows:
             self.chart.set_data("No data", metric, [])
@@ -809,6 +818,7 @@ class MainWindow(QMainWindow):
                 name = "system" if self._is_system_metric(metric) else str(row["battery_name"])
                 grouped[name].append((minutes, float(value)))
         self.chart.set_data(f"{metric} — {session_id}", metric, sorted(grouped.items()), chart_events)
+        self._clear_database_error_message()
 
     def refresh_sessions_and_chart(self, _checked: bool = False, *, prefer_running_session: bool = False) -> None:
         preferred_session_id = self._active_collector_session_id if prefer_running_session else None
@@ -861,7 +871,7 @@ class MainWindow(QMainWindow):
 
     def refresh_events(self) -> None:
         if not self.db_available:
-            self.events_table.setRowCount(0)
+            self._show_database_error()
             return
         session_id = self.session_combo.currentData()
         if not session_id:
@@ -871,7 +881,6 @@ class MainWindow(QMainWindow):
             events = self.db.fetch_events(str(session_id), limit=1000)
         except sqlite3.DatabaseError as exc:
             self._set_database_unavailable(exc)
-            self.events_table.setRowCount(0)
             self._show_database_error()
             return
         self.events_table.setRowCount(len(events))
@@ -1319,6 +1328,7 @@ class MainWindow(QMainWindow):
             self.sessions_manager.db = self.db
         self.db_available = True
         self.db_error = None
+        self._database_recovery_disabled = False
         self.db_status_label.setText(
             f"Database repaired. Backup: {result.backup_path}\n"
             + ", ".join(f"{table}: {result.copied[table]} copied, {result.failed[table]} failed" for table in result.copied)
@@ -1333,6 +1343,8 @@ class MainWindow(QMainWindow):
         return None if status.current_session_id is None else str(status.current_session_id)
 
     def _try_restore_database(self) -> None:
+        if self._database_recovery_disabled:
+            return
         replacement = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg, read_only=True)
         try:
             replacement.init_schema()
@@ -1342,6 +1354,8 @@ class MainWindow(QMainWindow):
         except sqlite3.DatabaseError as exc:
             replacement.close()
             self.db_error = str(exc)
+            self._database_recovery_disabled = self._is_persistent_database_error(exc)
+            self._show_database_error()
             return
 
         self.db.close()
@@ -1350,8 +1364,10 @@ class MainWindow(QMainWindow):
             self.sessions_manager.db = self.db
         self.db_available = True
         self.db_error = None
+        self._database_recovery_disabled = False
         if hasattr(self, "db_status_label"):
             self.db_status_label.setText("")
+        self._clear_database_error_message()
 
     def _restore_database_after_failed_repair(self, original_error: Exception) -> None:
         replacement = BatteryDatabase(self.cfg.resolved_db_path(), self.cfg, read_only=True)
@@ -1364,6 +1380,7 @@ class MainWindow(QMainWindow):
             replacement.close()
             self.db_available = False
             self.db_error = f"{original_error}; failed to reopen database after repair failure: {exc}"
+            self._database_recovery_disabled = self._is_persistent_database_error(exc)
             return
 
         self.db = replacement
@@ -1371,6 +1388,7 @@ class MainWindow(QMainWindow):
             self.sessions_manager.db = self.db
         self.db_available = True
         self.db_error = None
+        self._database_recovery_disabled = False
 
     def _show_repair_failure_state(self, exc: Exception) -> None:
         if not hasattr(self, "db_status_label"):
@@ -1390,11 +1408,24 @@ class MainWindow(QMainWindow):
     def _set_database_unavailable(self, exc: sqlite3.DatabaseError) -> None:
         self.db_available = False
         self.db_error = str(exc)
+        self._database_recovery_disabled = self._is_persistent_database_error(exc)
         self.db.close()
 
     def _show_database_error(self) -> None:
+        message = self._database_error_message()
         if hasattr(self, "db_status_label"):
-            self.db_status_label.setText(self._database_error_message())
+            self.db_status_label.setText(message)
+        if hasattr(self, "chart_status_label"):
+            suffix = ""
+            if self.chart.series or self.chart.events:
+                suffix = " Showing the last successfully loaded chart."
+            self.chart_status_label.setText(message.replace("\n", " ") + suffix)
+
+    def _clear_database_error_message(self) -> None:
+        if hasattr(self, "db_status_label"):
+            self.db_status_label.setText("")
+        if hasattr(self, "chart_status_label"):
+            self.chart_status_label.setText("")
 
     def _database_error_message(self) -> str:
         reason = self.db_error or "unknown SQLite error"
@@ -1403,6 +1434,11 @@ class MainWindow(QMainWindow):
             f"Path: {self.cfg.resolved_db_path()}\n"
             "Live status can still be refreshed, but recorded sessions are disabled until the database is repaired or moved aside."
         )
+
+    @staticmethod
+    def _is_persistent_database_error(exc: sqlite3.DatabaseError) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in PERSISTENT_DATABASE_ERROR_MARKERS)
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
