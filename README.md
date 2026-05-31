@@ -273,6 +273,10 @@ Events and TLP tools:
 
 ![Qt TLP tools](docs/screenshots/qt-tlp.png)
 
+ThinkPad hardware controls:
+
+![Qt ThinkPad controls](docs/screenshots/qt-thinkpad.png)
+
 ## Collector lifecycle
 
 ThinkPad Energy Manager keeps collector runtime state under the configured data directory:
